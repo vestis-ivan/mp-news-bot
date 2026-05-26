@@ -554,6 +554,11 @@ async def run_daily_digest_once(
         any_pending = True
         filtered_ads = filtered_ad_count(day_stats, cat)
         summary = await summarize_daily(cat, day, rows, filtered_ads)
+        if not summary and not daily_cfg.get("send_without_ai", False):
+            all_sent = False
+            result_lines.append(f"{label}: AI-сводка не сформировалась, очередь сохранена")
+            log.warning("daily_digest %s %s skipped: AI summary unavailable", cat, day)
+            continue
         text = build_daily_digest_text(cat, day, rows, summary, filtered_ads)
 
         target_sent = True
@@ -597,7 +602,8 @@ async def daily_digest_worker(out_bot: Bot, client: TelegramClient, conn) -> Non
 
             now = datetime.now(MSK)
             send_hour = int(daily_cfg.get("send_hour_msk", 9))
-            if now.hour < send_hour:
+            send_window_minutes = int(daily_cfg.get("send_window_minutes", 10))
+            if now.hour != send_hour or now.minute >= send_window_minutes:
                 continue
 
             day = (now.date() - timedelta(days=1)).isoformat()
@@ -618,6 +624,10 @@ async def daily_digest_worker(out_bot: Bot, client: TelegramClient, conn) -> Non
                 any_pending = True
                 filtered_ads = filtered_ad_count(day_stats, cat)
                 summary = await summarize_daily(cat, day, rows, filtered_ads)
+                if not summary and not daily_cfg.get("send_without_ai", False):
+                    all_sent = False
+                    log.warning("daily_digest %s %s skipped: AI summary unavailable", cat, day)
+                    continue
                 text = build_daily_digest_text(cat, day, rows, summary, filtered_ads)
 
                 sent = True

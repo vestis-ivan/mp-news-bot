@@ -130,9 +130,10 @@ docker compose run --rm bot python test_ai_from_posts.py maxprowb --limit 10 --a
 
 ## 6. Daily digest mode
 
-The bot now collects posts during the day by Moscow date and sends the previous day's digest after `daily_digest.send_hour_msk` in `config.yaml` (default: 09:00 MSK).
+The bot now collects posts during the day by Moscow date and sends the previous day's digest during the configured morning window: `daily_digest.send_hour_msk` plus `daily_digest.send_window_minutes` in `config.yaml` (default: 09:00-09:10 MSK).
 Before a post enters the daily queue, the bot filters obvious ads by regex and then asks OpenAI to classify hidden/self-promo ads. Filtered ads are counted in `/stats` and in the digest's "Не вошло" section.
 The daily digest is selective: OpenAI ranks posts by importance, includes only high-priority items, and moves weak opinions, repeats, minor cases, and noise into "Не вошло". It also adds action points, hypotheses to test, and practical observations when they follow from the posts.
+If OpenAI fails and `daily_digest.send_without_ai` is `false`, the queue is kept and the scheduled digest is not sent as a noisy fallback archive.
 
 The bot also has a catch-up scanner. In addition to live Telegram updates, it walks through all DB channels every `catchup.interval_seconds` seconds (default: 300), reads the latest `catchup.limit_per_channel` posts, and adds unseen messages to the same daily queue.
 
