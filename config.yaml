@@ -1,0 +1,129 @@
+# =============================================================================
+# Конфиг MP News Bot — только первичный посев и правила фильтрации.
+# Каналы после первого запуска управляются через бота (БД в data/state.db).
+# Куда слать новости — задаётся командой /here в нужном чате.
+# =============================================================================
+
+ai:
+  enabled: true
+  model: "gpt-4o-mini"
+  summarize_if_longer_than: 400
+  max_tokens: 180
+  system_prompt: |
+    Ты — редактор новостной ленты для селлеров маркетплейсов.
+    Сделай краткое саммари поста в 2-3 предложения на русском.
+    Сохрани ключевые цифры, даты, названия продуктов/функций.
+    Не добавляй ничего от себя. Не используй маркдаун.
+
+daily_digest:
+  enabled: true
+  send_hour_msk: 9
+  ai_max_chars: 16000
+  max_tokens: 1500
+  max_source_links: 25
+
+catchup:
+  enabled: true
+  interval_seconds: 300
+  limit_per_channel: 5
+  max_age_hours: 36
+  entity_timeout_seconds: 15
+  per_channel_delay_seconds: 0.4
+
+filter:
+  ai_ad_filter:
+    enabled: true
+    max_chars: 2500
+  block_patterns:
+    - "реклам[ау]\\s*[:.]"
+    - "erid\\s*[:=]"
+    - "ИНН\\s*\\d{10,12}"
+    - "партнёрский\\s+материал"
+    - "на правах рекламы"
+    - "#реклама"
+    - "#промо"
+  strip_lines:
+    - "подпиш(ись|итесь|итесь)"
+    - "^t\\.me/[a-zA-Z0-9_]+\\s*$"
+    - "^@[a-zA-Z0-9_]+\\s*$"
+    - "перешли\\s+друг"
+    - "приглашай\\s+друзей"
+
+# Каналы, которыми засеется БД при первом запуске.
+# Потом редактируешь через бота: /add, /remove, /move, /pause.
+channels:
+  mp_news:
+    - babkanyra
+    # ===== Ozon =====
+    - ozonmarketplace
+    - ozonwoman
+    - mrseller_chat
+    - donozn
+    - ant_ozon
+    - ozonbluerise
+    - ProdaemOZON
+    - shorobura_proMP
+    - ozonmaximal
+    - mkeeper
+    - roma_iz_sellium
+    - ozon_podpalmoy
+    - krasivie_dengi
+    - OZON_int
+    - ArinaAlexx
+    - ozonteam
+    - ozonru
+    - ozon_adv
+    - milliononozon
+    - marketplace_hogwarts
+    # ===== Wildberries =====
+    - maxprowb
+    - a_zheleznyakoff
+    - nevtalievblog
+    - nashputwildberries
+    - marketpapa_channel
+    - steputenkov
+    - vadimvedernikov
+    - wbfinance
+    - mayyadragan
+    - robo_wb
+    - vitaecom
+    - prodvizgenie_wb
+    - vadimcyberwb
+    - obzoriwildberries
+    - shkuricheva
+    - programmistwb
+    - wildbox_news
+    - kaizen_luchina
+    - vsegdaprosto
+    - aleksandrkozinfit
+    - burlak_na_mp
+    - zaitsevstepan
+    - urist_naWB
+    - quicktechpartner
+    - vsedlyamp
+    - globalwb
+    - wbsellerofficial
+    - mpgo_ru
+    - wbsharks
+    - sellermp
+    - wbhelpnews
+    - teinbillion
+    - wbbillion
+
+  marketing:
+    - redman
+    - target_i_pr
+    - PragmaticMarketingShkipin
+    - andrey_pro_business
+    - OsokinOsokin
+    - kudahiko
+    - marketpsy
+
+# Особый режим (digest) — пишется в БД при засеве как mode=digest
+special:
+  ozon_novosti:
+    category: mp_news
+    mode: digest
+    timezone: Europe/Moscow
+    schedule_hours: [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
+    digest_header: "🔔 Обновления базы знаний Ozon"

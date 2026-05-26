@@ -1,0 +1,15 @@
+services:
+  bot:
+    build: .
+    container_name: mp-news-bot
+    env_file: .env
+    volumes:
+      - ./data:/app/data          # SQLite + telethon-сессия
+      - ./config.yaml:/app/config.yaml:ro
+    restart: unless-stopped
+    # Первый запуск интерактивный, чтобы ввести код из ТГ:
+    # docker compose run --rm bot
+    # Дальше — docker compose up -d
+    stdin_open: true
+    tty: true
+

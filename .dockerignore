@@ -1,0 +1,10 @@
+.env
+.venv/
+data/
+__pycache__/
+**/__pycache__/
+*.pyc
+.git/
+.idea/
+.vscode/
+mp-news-bot-vps.tar.gz
