@@ -16,6 +16,7 @@ import asyncio
 import html
 import logging
 import os
+import sqlite3
 import signal
 import sys
 from datetime import datetime, timedelta, timezone
@@ -136,6 +137,74 @@ async def ai_is_ad(text: str) -> bool:
         return False
 
 
+async def ai_classify_post(text: str) -> str:
+    ai_filter = CFG.get("filter", {}).get("ai_ad_filter", {})
+    if not ai or not ai_filter.get("enabled", False):
+        return "KEEP"
+
+    sample = text.strip()
+    if not sample:
+        return "NOISE"
+
+    max_chars = int(ai_filter.get("max_chars", 2500))
+    sample = sample[:max_chars]
+
+    try:
+        resp = await ai.chat.completions.create(
+            model=CFG["ai"]["model"],
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Classify a Russian Telegram post for a marketplace seller digest. "
+                        "Return only one token: KEEP, AD, or NOISE. "
+                        "KEEP: factual marketplace news, rule changes, deadlines, fees, logistics, "
+                        "ads platform changes, useful cases with numbers, practical tips. "
+                        "AD: paid promotion, self-promotion, course/webinar/service sales, referral links, "
+                        "giveaways, livestream announcements, calls to register/contact/buy/subscribe. "
+                        "NOISE: opinions without facts, polls, jokes, personal stories, vague motivation, "
+                        "minor cases without useful lesson, repeated discussion prompts. "
+                        "If unsure between KEEP and NOISE, choose KEEP only when there is a concrete fact "
+                        "or applicable seller insight."
+                    ),
+                },
+                {"role": "user", "content": sample},
+            ],
+            max_tokens=4,
+            temperature=0,
+        )
+        verdict = (resp.choices[0].message.content or "").strip().upper()
+        if verdict.startswith("AD"):
+            return "AD"
+        if verdict.startswith("NOISE"):
+            return "NOISE"
+        return "KEEP"
+    except Exception as e:
+        log.warning("OpenAI post classifier fail: %s", e)
+        return "KEEP"
+
+
+async def check_openai_status() -> tuple[bool, str]:
+    if not CFG.get("ai", {}).get("enabled", False):
+        return False, "disabled in config.yaml"
+    if not ai:
+        return False, "OPENAI_API_KEY is empty"
+    try:
+        resp = await ai.chat.completions.create(
+            model=CFG["ai"]["model"],
+            messages=[
+                {"role": "system", "content": "Reply with OK."},
+                {"role": "user", "content": "ping"},
+            ],
+            max_tokens=3,
+            temperature=0,
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        return True, text or "OK"
+    except Exception as e:
+        return False, str(e)
+
+
 # ---------- Форматирование ----------------------------------------------------
 
 def format_msg(*, source: str, title: str, msg_id: int, body: str, summary: str | None) -> str:
@@ -236,6 +305,10 @@ def daily_bucket(day: str, category: str) -> str:
     return f"daily:{day}:{category}"
 
 
+def quarantine_bucket(day: str, category: str) -> str:
+    return f"quarantine:{day}:{category}"
+
+
 def filtered_ad_count(day_stats, category: str) -> int:
     return day_stats.get((category, "blocked_ad"), 0) + day_stats.get((category, "blocked_ai_ad"), 0)
 
@@ -269,21 +342,34 @@ async def handle_message_from_chat(out_bot: Bot, client: TelegramClient, conn, m
     if text and is_ad(text):
         log.info("[%s/%d] ad → skip", username, msg.id)
         st.bump_stat(conn, day, ch.category, "blocked_ad")
+        st.bump_source_stat(conn, day, username, ch.category, "blocked_ad")
+        st.enqueue_digest(conn, quarantine_bucket(day, ch.category), username, msg.chat_id, msg.id, "[AD_REGEX]\n" + text[:2000])
         return
 
     cleaned = clean_text(text) if text else ""
     if not cleaned:
         st.bump_stat(conn, day, ch.category, "skipped_empty")
+        st.bump_source_stat(conn, day, username, ch.category, "skipped_empty")
         return
 
-    if await ai_is_ad(cleaned):
+    classification = await ai_classify_post(cleaned)
+    if classification == "AD":
         log.info("[%s/%d] ai-ad -> skip", username, msg.id)
         st.bump_stat(conn, day, ch.category, "blocked_ai_ad")
+        st.bump_source_stat(conn, day, username, ch.category, "blocked_ai_ad")
+        st.enqueue_digest(conn, quarantine_bucket(day, ch.category), username, msg.chat_id, msg.id, "[AD_AI]\n" + cleaned)
+        return
+    if classification == "NOISE":
+        log.info("[%s/%d] ai-noise -> quarantine", username, msg.id)
+        st.bump_stat(conn, day, ch.category, "blocked_noise")
+        st.bump_source_stat(conn, day, username, ch.category, "blocked_noise")
+        st.enqueue_digest(conn, quarantine_bucket(day, ch.category), username, msg.chat_id, msg.id, "[NOISE]\n" + cleaned)
         return
 
     bucket = daily_bucket(day, ch.category)
     st.enqueue_digest(conn, bucket, username, msg.chat_id, msg.id, cleaned)
     st.bump_stat(conn, day, ch.category, "queued_daily")
+    st.bump_source_stat(conn, day, username, ch.category, "queued_daily")
     log.info("[%s/%d] -> daily queue %s", username, msg.id, bucket)
     return
 
@@ -523,6 +609,8 @@ async def run_daily_digest_once(
     force: bool = False,
     mark_schedule: bool = False,
     consume: bool = True,
+    send_target: bool = True,
+    send_admins_copy: bool = True,
 ) -> str:
     daily_cfg = CFG.get("daily_digest", {})
     if not daily_cfg.get("enabled", True) and not force:
@@ -539,9 +627,12 @@ async def run_daily_digest_once(
     day_stats = st.stats_for_day(conn, day)
     any_pending = False
     all_sent = True
-    result_lines = [f"✅ Экстренный запуск сводки за {day}"]
+    mode = "отправка" if send_target else "предпросмотр"
+    result_lines = [f"✅ Ручной запуск сводки за {day}: {mode}"]
     if not consume:
         result_lines.append("Очередь не очищается: утренний дайджест в 09:00 МСК соберет полный день.")
+    if not send_target:
+        result_lines.append("В целевой канал не отправляю: это preview для админов.")
 
     for cat in ("mp_news", "marketing"):
         bucket = daily_bucket(day, cat)
@@ -562,18 +653,22 @@ async def run_daily_digest_once(
         text = build_daily_digest_text(cat, day, rows, summary, filtered_ads)
 
         target_sent = True
-        for chunk in chunk_text(text, 4000):
-            if not await send_to_target(out_bot, client, conn, cat, text=chunk):
-                target_sent = False
-                break
+        if send_target:
+            for chunk in chunk_text(text, 4000):
+                if not await send_to_target(out_bot, client, conn, cat, text=chunk):
+                    target_sent = False
+                    break
 
-        admin_copies = await send_to_admins(out_bot, conn, text)
+        admin_copies = await send_to_admins(out_bot, conn, text) if send_admins_copy else 0
 
         if target_sent:
             if consume:
                 st.delete_bucket(conn, bucket)
                 st.bump_stat(conn, day, cat, "sent_daily_digest")
                 result_lines.append(f"{label}: отправлено {len(rows)} постов, очередь очищена, копий админам {admin_copies}")
+            elif not send_target:
+                st.bump_stat(conn, day, cat, "preview_digest")
+                result_lines.append(f"{label}: preview собран по {len(rows)} постам, очередь сохранена, копий админам {admin_copies}")
             else:
                 st.bump_stat(conn, day, cat, "sent_manual_digest")
                 result_lines.append(f"{label}: отправлено {len(rows)} постов, очередь сохранена, копий админам {admin_copies}")
@@ -775,10 +870,42 @@ async def catchup_worker(out_bot: Bot, client: TelegramClient, conn) -> None:
     while True:
         try:
             scanned, handled, errors = await catchup_scan_once(out_bot, client, conn)
+            st.setting_set(conn, "last_catchup_at", datetime.now(MSK).isoformat(timespec="seconds"))
+            st.setting_set(conn, "last_catchup_result", f"channels={scanned}, new_messages={handled}, errors={errors}")
             log.info("catchup scan done: channels=%d, new_messages=%d, errors=%d", scanned, handled, errors)
         except Exception as e:
             log.exception("catchup scan loop fail: %s", e)
         await asyncio.sleep(interval)
+
+
+def backup_db_once(conn) -> Path:
+    backup_dir = DB_PATH.parent / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    out = backup_dir / f"state-{datetime.now(MSK).date().isoformat()}.db"
+    dest = sqlite3.connect(out)
+    try:
+        conn.backup(dest)
+    finally:
+        dest.close()
+    return out
+
+
+async def backup_worker(conn) -> None:
+    last_key: str | None = None
+    while True:
+        await asyncio.sleep(300)
+        try:
+            now = datetime.now(MSK)
+            key = now.date().isoformat()
+            if now.hour != 3 or now.minute >= 10 or last_key == key:
+                continue
+            path = backup_db_once(conn)
+            st.setting_set(conn, "last_backup_at", now.isoformat(timespec="seconds"))
+            st.setting_set(conn, "last_backup_path", str(path))
+            last_key = key
+            log.info("DB backup saved: %s", path)
+        except Exception as e:
+            log.exception("DB backup fail: %s", e)
 
 
 # ---------- Точка входа -------------------------------------------------------
@@ -803,6 +930,12 @@ async def main() -> None:
     if not st.list_channels(conn):
         n = st.seed_from_yaml(conn, CFG)
         log.info("Посеяно из yaml: %d каналов", n)
+    saved_catchup_age = st.setting_get(conn, "catchup_max_age_hours")
+    if saved_catchup_age:
+        try:
+            CFG.setdefault("catchup", {})["max_age_hours"] = float(saved_catchup_age)
+        except ValueError:
+            log.warning("Bad saved catchup_max_age_hours ignored: %s", saved_catchup_age)
 
     # Bot для отправки + админ-панели (один инстанс на оба)
     bot_token = os.environ["TG_BOT_TOKEN"]
@@ -824,6 +957,18 @@ async def main() -> None:
     log.info("В базе %d каналов. Слушаем входящие апдейты и сверяемся с БД динамически.", len(st.list_channels(conn)))
 
     log.info("Dynamic channel mode enabled: /add and /addlist changes are picked up without restart")
+    openai_ok, openai_message = await check_openai_status()
+    st.setting_set(conn, "openai_status", "OK" if openai_ok else "FAIL")
+    st.setting_set(conn, "openai_last_check_at", datetime.now(MSK).isoformat(timespec="seconds"))
+    st.setting_set(conn, "openai_last_message", openai_message[:500])
+    startup_lines = [
+        "✅ Бот запущен.",
+        f"Каналов: {len(st.list_channels(conn))}",
+        f"OpenAI: {'OK' if openai_ok else 'FAIL'}",
+    ]
+    if not openai_ok:
+        startup_lines.append(f"Причина: {openai_message[:800]}")
+    await send_to_admins(out_bot, conn, "\n".join(startup_lines))
 
     @client.on(events.NewMessage())
     async def _on_new(event):
@@ -834,7 +979,18 @@ async def main() -> None:
 
     # Конкурентные таски
     async def _runjob(raw_day: str | None = None) -> str:
-        day = resolve_runjob_day(conn, raw_day)
+        raw = (raw_day or "").strip()
+        parts = raw.split()
+        send_target = False
+        day_arg: str | None = raw or None
+        if parts and parts[0].lower() in ("send", "отправить"):
+            send_target = True
+            day_arg = " ".join(parts[1:]) or None
+        elif parts and parts[0].lower() in ("preview", "превью"):
+            send_target = False
+            day_arg = " ".join(parts[1:]) or None
+
+        day = resolve_runjob_day(conn, day_arg)
         return await run_daily_digest_once(
             out_bot,
             client,
@@ -843,12 +999,67 @@ async def main() -> None:
             force=True,
             mark_schedule=False,
             consume=False,
+            send_target=send_target,
+            send_admins_copy=True,
         )
+
+    async def _health_check() -> str:
+        today = datetime.now(MSK).date().isoformat()
+        yesterday = (datetime.now(MSK).date() - timedelta(days=1)).isoformat()
+        openai_ok_now, openai_msg_now = await check_openai_status()
+        st.setting_set(conn, "openai_status", "OK" if openai_ok_now else "FAIL")
+        st.setting_set(conn, "openai_last_check_at", datetime.now(MSK).isoformat(timespec="seconds"))
+        st.setting_set(conn, "openai_last_message", openai_msg_now[:500])
+        telethon_ok = await client.is_user_authorized()
+        return "\n".join([
+            "🩺 <b>Health</b>",
+            f"Telethon: {'OK' if telethon_ok else 'FAIL'}",
+            f"OpenAI: {'OK' if openai_ok_now else 'FAIL'}",
+            f"OpenAI msg: {html.escape(openai_msg_now[:300])}",
+            f"Каналов: {len(st.list_channels(conn))}",
+            f"Очередь сегодня MP: {st.queue_size(conn, daily_bucket(today, 'mp_news'))}",
+            f"Очередь сегодня маркетинг: {st.queue_size(conn, daily_bucket(today, 'marketing'))}",
+            f"Карантин сегодня MP: {st.queue_size(conn, quarantine_bucket(today, 'mp_news'))}",
+            f"Карантин сегодня маркетинг: {st.queue_size(conn, quarantine_bucket(today, 'marketing'))}",
+            f"Очередь вчера MP: {st.queue_size(conn, daily_bucket(yesterday, 'mp_news'))}",
+            f"Очередь вчера маркетинг: {st.queue_size(conn, daily_bucket(yesterday, 'marketing'))}",
+            f"Last catchup: {html.escape(st.setting_get(conn, 'last_catchup_at', 'never') or 'never')}",
+            f"Catchup result: {html.escape(st.setting_get(conn, 'last_catchup_result', '-') or '-')}",
+            f"Last backup: {html.escape(st.setting_get(conn, 'last_backup_at', 'never') or 'never')}",
+        ])
+
+    async def _check_channels() -> str:
+        ok: list[str] = []
+        bad: list[str] = []
+        for ch in st.list_channels(conn):
+            try:
+                await asyncio.wait_for(client.get_entity(ch.username), timeout=12)
+                ok.append(ch.username)
+            except Exception as e:
+                bad.append(f"@{ch.username}: {type(e).__name__}")
+        lines = [
+            "🔎 <b>Проверка каналов</b>",
+            f"OK: {len(ok)}",
+            f"Нет доступа/ошибка: {len(bad)}",
+        ]
+        if bad:
+            lines.append("\nПроблемные:")
+            lines.extend(bad[:40])
+            if len(bad) > 40:
+                lines.append(f"...и еще {len(bad) - 40}")
+        return "\n".join(lines)
 
     tasks = [
         asyncio.create_task(catchup_worker(out_bot, client, conn), name="catchup-scan"),
         asyncio.create_task(daily_digest_worker(out_bot, client, conn), name="daily-digest"),
-        asyncio.create_task(admin_bot.run_admin_bot(out_bot, conn, run_job=_runjob), name="admin-bot"),
+        asyncio.create_task(backup_worker(conn), name="db-backup"),
+        asyncio.create_task(admin_bot.run_admin_bot(
+            out_bot,
+            conn,
+            run_job=_runjob,
+            health_check=_health_check,
+            check_channels=_check_channels,
+        ), name="admin-bot"),
     ]
 
     log.info("Бот стартовал. Ждём апдейты…")

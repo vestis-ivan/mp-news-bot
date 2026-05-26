@@ -73,6 +73,16 @@ CREATE TABLE IF NOT EXISTS stats (
     PRIMARY KEY (day, category, metric)
 );
 
+-- Статистика по каналам-источникам для рейтинга качества и авто-паузы.
+CREATE TABLE IF NOT EXISTS source_stats (
+    day        TEXT    NOT NULL,            -- YYYY-MM-DD
+    source     TEXT    NOT NULL,            -- username без @
+    category   TEXT    NOT NULL,
+    metric     TEXT    NOT NULL,            -- queued_daily | blocked_ad | blocked_ai_ad | blocked_noise
+    cnt        INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, source, category, metric)
+);
+
 -- Глобальные настройки key-value (например last_weekend_digest_at)
 CREATE TABLE IF NOT EXISTS settings (
     k TEXT PRIMARY KEY,
@@ -303,6 +313,31 @@ def stats_for_day(conn: sqlite3.Connection, day: str) -> dict[tuple[str, str], i
     ):
         out[(r["category"], r["metric"])] = int(r["cnt"])
     return out
+
+
+def bump_source_stat(
+    conn: sqlite3.Connection,
+    day: str,
+    source: str,
+    category: str,
+    metric: str,
+    n: int = 1,
+) -> None:
+    conn.execute(
+        "INSERT INTO source_stats (day, source, category, metric, cnt) VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(day, source, category, metric) DO UPDATE SET cnt = cnt + excluded.cnt",
+        (day, source.lower().lstrip("@"), category, metric, n),
+    )
+
+
+def source_stats_since(conn: sqlite3.Connection, since_day: str) -> list[sqlite3.Row]:
+    return list(conn.execute(
+        "SELECT source, category, metric, SUM(cnt) AS cnt "
+        "FROM source_stats WHERE day >= ? "
+        "GROUP BY source, category, metric "
+        "ORDER BY source, category, metric",
+        (since_day,),
+    ))
 
 
 # ---------- settings ----------------------------------------------------------

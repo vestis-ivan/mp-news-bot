@@ -45,6 +45,7 @@ from aiogram.types import (
 )
 
 from app import state as st
+from app.common import CFG
 
 
 log = logging.getLogger("admin-bot")
@@ -199,6 +200,49 @@ def parse_usernames_block(raw: str) -> tuple[list[str], list[str]]:
     return usernames, bad
 
 
+def daily_bucket(day: str, category: str) -> str:
+    return f"daily:{day}:{category}"
+
+
+def quarantine_bucket(day: str, category: str) -> str:
+    return f"quarantine:{day}:{category}"
+
+
+def resolve_day(raw: str | None = None) -> str:
+    today = datetime.now(MSK).date()
+    value = (raw or "today").strip().lower()
+    if value in ("today", "сегодня"):
+        return today.isoformat()
+    if value in ("yesterday", "вчера"):
+        return (today - timedelta(days=1)).isoformat()
+    datetime.strptime(value, "%Y-%m-%d")
+    return value
+
+
+def source_scoreboard(conn, days: int = 7) -> list[dict[str, Any]]:
+    since = (datetime.now(MSK).date() - timedelta(days=max(days - 1, 0))).isoformat()
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in st.source_stats_since(conn, since):
+        source = row["source"]
+        item = grouped.setdefault(source, {
+            "source": source,
+            "category": row["category"],
+            "queued_daily": 0,
+            "blocked_ad": 0,
+            "blocked_ai_ad": 0,
+            "blocked_noise": 0,
+            "skipped_empty": 0,
+        })
+        item[row["metric"]] = int(row["cnt"])
+    for item in grouped.values():
+        item["useful"] = item.get("queued_daily", 0)
+        item["bad"] = item.get("blocked_ad", 0) + item.get("blocked_ai_ad", 0) + item.get("blocked_noise", 0)
+        total = item["useful"] + item["bad"]
+        item["total"] = total
+        item["bad_ratio"] = item["bad"] / total if total else 0
+    return list(grouped.values())
+
+
 # ---------- middleware: проверка прав --------------------------------------------
 
 def admin_only(conn) -> Callable[[Message, dict], Awaitable[bool]]:
@@ -276,7 +320,13 @@ class AddFlow(StatesGroup):
 
 # ---------- роутер --------------------------------------------------------------
 
-def build_router(conn, bot: Bot, run_job: Callable[[str | None], Awaitable[str]] | None = None) -> Router:
+def build_router(
+    conn,
+    bot: Bot,
+    run_job: Callable[[str | None], Awaitable[str]] | None = None,
+    health_check: Callable[[], Awaitable[str]] | None = None,
+    check_channels: Callable[[], Awaitable[str]] | None = None,
+) -> Router:
     r = Router(name="admin")
     check = admin_only(conn)
 
@@ -536,6 +586,34 @@ def build_router(conn, bot: Bot, run_job: Callable[[str | None], Awaitable[str]]
             return
         await msg.answer(_stats_text(conn), reply_markup=main_menu_kb())
 
+    @r.message(Command("health"))
+    async def cmd_health(msg: Message):
+        if not await check(msg):
+            return
+        if health_check is None:
+            await msg.answer("❌ Health-check не подключен.")
+            return
+        notice = await msg.answer("⏳ Проверяю здоровье бота...")
+        try:
+            await notice.edit_text(await health_check())
+        except Exception as e:
+            log.exception("health fail: %s", e)
+            await notice.edit_text(f"❌ Health-check упал: {e}")
+
+    @r.message(Command("checkchannels"))
+    async def cmd_checkchannels(msg: Message):
+        if not await check(msg):
+            return
+        if check_channels is None:
+            await msg.answer("❌ Проверка каналов не подключена.")
+            return
+        notice = await msg.answer("⏳ Проверяю доступ к каналам...")
+        try:
+            await notice.edit_text(await check_channels())
+        except Exception as e:
+            log.exception("checkchannels fail: %s", e)
+            await notice.edit_text(f"❌ Проверка каналов упала: {e}")
+
     @r.message(Command("runjob"))
     async def cmd_runjob(msg: Message, command: CommandObject):
         if not await check(msg):
@@ -545,7 +623,12 @@ def build_router(conn, bot: Bot, run_job: Callable[[str | None], Awaitable[str]]
             return
 
         raw_day = (command.args or "").strip() or None
-        notice = await msg.answer("⏳ Собираю и отправляю дайджест из уже накопленной очереди...")
+        is_send = bool(raw_day and raw_day.split()[0].lower() in ("send", "отправить"))
+        notice = await msg.answer(
+            "⏳ Отправляю дайджест в целевой канал..."
+            if is_send else
+            "⏳ Собираю preview дайджеста для админов без отправки в канал..."
+        )
         try:
             result = await run_job(raw_day)
         except ValueError as e:
@@ -555,6 +638,139 @@ def build_router(conn, bot: Bot, run_job: Callable[[str | None], Awaitable[str]]
             await notice.edit_text(f"❌ Не получилось запустить сводку: {e}")
         else:
             await notice.edit_text(result)
+
+    @r.message(Command("queue"))
+    async def cmd_queue(msg: Message, command: CommandObject):
+        if not await check(msg):
+            return
+        parts = (command.args or "").split()
+        day_first = bool(parts and parts[0].lower() not in ("mp_news", "marketing", "all", "quarantine"))
+        try:
+            day = resolve_day(parts[0]) if day_first else resolve_day(None)
+        except ValueError:
+            await msg.answer("❌ Дата: today/yesterday/YYYY-MM-DD.")
+            return
+        rest = parts[1:] if day_first else parts
+        category = next((p.lower() for p in rest if p.lower() in ("mp_news", "marketing", "all")), "all")
+        show_quarantine = any(p.lower() == "quarantine" for p in rest)
+        cats = ("mp_news", "marketing") if category == "all" else (category,)
+        lines = [f"📦 <b>Очередь за {day}</b>"]
+        for cat in cats:
+            bucket = quarantine_bucket(day, cat) if show_quarantine else daily_bucket(day, cat)
+            rows = st.list_bucket(conn, bucket)
+            title = "карантин" if show_quarantine else "дайджест"
+            lines.append(f"\n<b>{CATEGORY_LABEL[cat]} · {title}: {len(rows)}</b>")
+            for r in rows[:10]:
+                source = str(r["source"]).strip().lstrip("@")
+                text = str(r["text"]).replace("\n", " ").strip()
+                if len(text) > 130:
+                    text = text[:130].rsplit(" ", 1)[0].strip() + "..."
+                lines.append(f"— @{source}/{r['msg_id']}: {html.escape(text)}")
+            if len(rows) > 10:
+                lines.append(f"— ...и еще {len(rows) - 10}")
+        await msg.answer("\n".join(lines))
+
+    @r.message(Command("clearqueue"))
+    async def cmd_clearqueue(msg: Message, command: CommandObject):
+        if not await check(msg):
+            return
+        parts = (command.args or "").split()
+        if not parts:
+            await msg.answer("Использование: <code>/clearqueue today all</code> или <code>/clearqueue today all quarantine</code>")
+            return
+        try:
+            day = resolve_day(parts[0])
+        except ValueError:
+            await msg.answer("❌ Дата: today/yesterday/YYYY-MM-DD.")
+            return
+        rest = [p.lower() for p in parts[1:]]
+        unknown = [p for p in rest if p not in ("all", "mp_news", "marketing", "quarantine")]
+        if unknown:
+            await msg.answer("❌ Категория: all/mp_news/marketing/quarantine.")
+            return
+        category = next((p for p in rest if p in ("all", "mp_news", "marketing")), "all")
+        show_quarantine = "quarantine" in rest
+        cats = ("mp_news", "marketing") if category == "all" else (category,)
+        deleted = []
+        for cat in cats:
+            bucket = quarantine_bucket(day, cat) if show_quarantine else daily_bucket(day, cat)
+            n = st.queue_size(conn, bucket)
+            st.delete_bucket(conn, bucket)
+            label = "quarantine" if show_quarantine else "daily"
+            deleted.append(f"{cat}/{label}: {n}")
+        await msg.answer("🧹 Очередь очищена:\n" + "\n".join(deleted))
+
+    @r.message(Command("sources"))
+    async def cmd_sources(msg: Message, command: CommandObject):
+        if not await check(msg):
+            return
+        try:
+            days = int((command.args or "7").split()[0])
+        except ValueError:
+            days = 7
+        rows = source_scoreboard(conn, days)
+        useful = sorted(rows, key=lambda x: (x["useful"], -x["bad"]), reverse=True)[:10]
+        noisy = sorted([r for r in rows if r["total"]], key=lambda x: (x["bad_ratio"], x["bad"]), reverse=True)[:10]
+        lines = [f"📈 <b>Источники за {days} дн.</b>", "\n<b>Топ полезных:</b>"]
+        lines += [f"— @{r['source']}: useful {r['useful']}, bad {r['bad']}" for r in useful] or ["— нет данных"]
+        lines.append("\n<b>Топ мусор/реклама:</b>")
+        lines += [f"— @{r['source']}: bad {r['bad']}/{r['total']} ({r['bad_ratio']:.0%})" for r in noisy] or ["— нет данных"]
+        await msg.answer("\n".join(lines))
+
+    @r.message(Command("autopause"))
+    async def cmd_autopause(msg: Message, command: CommandObject):
+        if not await check(msg):
+            return
+        parts = (command.args or "").split()
+        try:
+            days = int(parts[0]) if parts else 7
+            bad_ratio = float(parts[1]) if len(parts) > 1 else 0.8
+            min_count = int(parts[2]) if len(parts) > 2 else 5
+        except ValueError:
+            await msg.answer("Использование: <code>/autopause 7 0.8 5</code> — дни, доля мусора, минимум постов.")
+            return
+        if bad_ratio > 1:
+            bad_ratio = bad_ratio / 100
+        rows = [
+            r for r in source_scoreboard(conn, days)
+            if r["total"] >= min_count and r["bad_ratio"] >= bad_ratio and st.get_channel(conn, r["source"])
+        ]
+        rows = sorted(rows, key=lambda x: (x["bad_ratio"], x["bad"]), reverse=True)[:20]
+        if not rows:
+            await msg.answer(f"✅ За {days} дн. кандидатов на авто-паузу нет. Порог: {bad_ratio:.0%}, минимум постов: {min_count}.")
+            return
+        text = "\n".join(
+            [f"⏸ <b>Кандидаты на паузу за {days} дн.</b>", f"Порог: {bad_ratio:.0%}, минимум постов: {min_count}"] +
+            [f"— @{r['source']}: bad {r['bad']}/{r['total']} ({r['bad_ratio']:.0%})" for r in rows]
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"⏸ @{r['source']}", callback_data=f"pause:{r['source']}")]
+            for r in rows[:10]
+        ])
+        await msg.answer(text, reply_markup=kb)
+
+    @r.message(Command("catchup"))
+    async def cmd_catchup(msg: Message, command: CommandObject):
+        if not await check(msg):
+            return
+        raw = (command.args or "").strip()
+        if raw:
+            try:
+                hours = float(raw)
+            except ValueError:
+                await msg.answer("Использование: <code>/catchup 12</code> — окно догоняющего сканера в часах.")
+                return
+            CFG.setdefault("catchup", {})["max_age_hours"] = hours
+            st.setting_set(conn, "catchup_max_age_hours", str(hours))
+        cfg = CFG.get("catchup", {})
+        await msg.answer(
+            "🕘 <b>Catch-up scanner</b>\n"
+            f"enabled: {cfg.get('enabled', True)}\n"
+            f"interval_seconds: {cfg.get('interval_seconds', 300)}\n"
+            f"limit_per_channel: {cfg.get('limit_per_channel', 5)}\n"
+            f"max_age_hours: {cfg.get('max_age_hours', 36)}\n"
+            f"last: {st.setting_get(conn, 'last_catchup_at', 'never')}"
+        )
 
     @r.callback_query(F.data.startswith("adm_ok:"))
     async def cb_admin_approve(c: CallbackQuery):
@@ -817,9 +1033,18 @@ def build_router(conn, bot: Bot, run_job: Callable[[str | None], Awaitable[str]]
             "<code>/resume @username</code>\n"
             "<code>/list mp_news|marketing</code>\n"
             "<code>/stats</code> — статистика за день\n"
-            "<code>/runjob</code> — сразу отправить дайджест за сегодня, не очищая очередь\n"
+            "<code>/runjob</code> — preview дайджеста админам, очередь не очищается\n"
+            "<code>/runjob send</code> — отправить дайджест в целевой чат, очередь не очищается\n"
+            "<code>/queue today all</code> — посмотреть накопленные посты\n"
+            "<code>/queue today all quarantine</code> — посмотреть отсеянное\n"
+            "<code>/clearqueue today all</code> — очистить очередь вручную\n"
+            "<code>/sources 7</code> — качество источников за N дней\n"
+            "<code>/autopause 7</code> — кандидаты на паузу из шумных источников\n"
+            "<code>/health</code> — проверка Telegram/OpenAI/очередей\n"
+            "<code>/checkchannels</code> — проверить доступ к каналам\n"
+            "<code>/catchup 36</code> — окно догоняющего сканера в часах\n"
             "<code>/cancel</code> — сбросить текущий ввод\n\n"
-            "💡 Бот копит посты весь день по московской дате и после 09:00 МСК отправляет сводку за вчера."
+            "💡 Бот копит посты весь день по московской дате и в 09:00-09:10 МСК отправляет сводку за вчера."
         )
         await c.message.edit_text(text, reply_markup=main_menu_kb())
         await c.answer()
@@ -906,17 +1131,21 @@ def _stats_text(conn) -> str:
     q_today_m = st.queue_size(conn, f"daily:{today_s}:marketing")
     q_yday_mp = st.queue_size(conn, f"daily:{yesterday_s}:mp_news")
     q_yday_m = st.queue_size(conn, f"daily:{yesterday_s}:marketing")
+    quarantine_today_mp = st.queue_size(conn, f"quarantine:{today_s}:mp_news")
+    quarantine_today_m = st.queue_size(conn, f"quarantine:{today_s}:marketing")
+    quarantine_yday_mp = st.queue_size(conn, f"quarantine:{yesterday_s}:mp_news")
+    quarantine_yday_m = st.queue_size(conn, f"quarantine:{yesterday_s}:marketing")
 
     return (
         "📊 <b>Статистика</b>\n\n"
         f"<b>Сегодня</b> ({today_s})\n"
-        f"🛒 MP: в очереди {q_today_mp}, реклама {ads_total(s, 'mp_news')}\n"
-        f"📣 Маркетинг: в очереди {q_today_m}, реклама {ads_total(s, 'marketing')}\n\n"
+        f"🛒 MP: в очереди {q_today_mp}, карантин {quarantine_today_mp}, реклама {ads_total(s, 'mp_news')}, шум {cell(s, 'mp_news', 'blocked_noise')}\n"
+        f"📣 Маркетинг: в очереди {q_today_m}, карантин {quarantine_today_m}, реклама {ads_total(s, 'marketing')}, шум {cell(s, 'marketing', 'blocked_noise')}\n\n"
         f"<b>Вчера</b> ({yesterday_s})\n"
-        f"🛒 MP: в очереди {q_yday_mp}, утренних сводок {cell(sy, 'mp_news', 'sent_daily_digest')}\n"
-        f"📣 Маркетинг: в очереди {q_yday_m}, утренних сводок {cell(sy, 'marketing', 'sent_daily_digest')}\n\n"
+        f"🛒 MP: в очереди {q_yday_mp}, карантин {quarantine_yday_mp}, утренних сводок {cell(sy, 'mp_news', 'sent_daily_digest')}\n"
+        f"📣 Маркетинг: в очереди {q_yday_m}, карантин {quarantine_yday_m}, утренних сводок {cell(sy, 'marketing', 'sent_daily_digest')}\n\n"
         "<b>Режим</b>\n"
-        "Бот копит посты весь день по московской дате и после 09:00 МСК отправляет сводку за вчера."
+        "Бот копит посты весь день по московской дате и отправляет сводку за вчера только в окне 09:00-09:10 МСК."
     )
 
 
@@ -924,10 +1153,20 @@ async def run_admin_bot(
     bot: Bot,
     conn,
     run_job: Callable[[str | None], Awaitable[str]] | None = None,
+    health_check: Callable[[], Awaitable[str]] | None = None,
+    check_channels: Callable[[], Awaitable[str]] | None = None,
 ) -> None:
     """Запускает aiogram-роутер на ПЕРЕДАННОМ боте (тот же, что шлёт посты)."""
     dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(build_router(conn, bot, run_job=run_job))
+    dp.include_router(
+        build_router(
+            conn,
+            bot,
+            run_job=run_job,
+            health_check=health_check,
+            check_channels=check_channels,
+        )
+    )
     me = await bot.get_me()
     log.info("Админ-панель работает в боте @%s", me.username)
     await bot.delete_webhook(drop_pending_updates=True)
