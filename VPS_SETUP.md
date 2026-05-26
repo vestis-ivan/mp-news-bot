@@ -13,11 +13,10 @@ cd ~/mp-news-bot
 ## 2. Create `.env`
 
 ```bash
-cp .env.vps.example .env
 nano .env
 ```
 
-Fill:
+Paste and fill:
 
 ```env
 TG_API_ID=
@@ -140,10 +139,18 @@ The bot also has a catch-up scanner. In addition to live Telegram updates, it wa
 Admin commands:
 
 ```text
-/runjob          # send today's already collected queue immediately
+/runjob                    # preview today's digest to admins, queue stays
 /runjob today
 /runjob yesterday
 /runjob 2026-05-25
+/runjob send               # send today's digest to target chat, queue still stays
+/queue today all           # show daily queue
+/queue today all quarantine # show filtered ads/noise
+/sources 7                 # source quality for 7 days
+/autopause 7 0.8 5         # pause candidates: days, bad ratio, min posts
+/health                    # Telegram/OpenAI/queue diagnostics
+/checkchannels             # check Telethon access to channels
+/catchup 36                # catch-up scanner window in hours
 ```
 
 Manual `/runjob` does not clear the queue. The scheduled 09:00 MSK digest will still send the full previous day and only then clear that day's queue.
@@ -162,7 +169,9 @@ Every digest is sent to the configured `/here` target and copied to all approved
 ## 7. Update after replacing files
 
 ```bash
-docker compose build
+git pull
+docker compose down
+docker compose build --no-cache
 docker compose up -d
 docker compose logs -f --tail=100
 ```
