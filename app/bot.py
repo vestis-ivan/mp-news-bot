@@ -313,6 +313,14 @@ def filtered_ad_count(day_stats, category: str) -> int:
     return day_stats.get((category, "blocked_ad"), 0) + day_stats.get((category, "blocked_ai_ad"), 0)
 
 
+def daily_digest_done_key(day: str, category: str, send_hour: int) -> str:
+    return f"last_daily_digest:{day}:{category}:{send_hour}"
+
+
+def daily_digest_fail_notice_key(day: str, category: str, send_hour: int) -> str:
+    return f"daily_digest_fail_notice:{day}:{category}:{send_hour}"
+
+
 async def handle_message(out_bot: Bot, client: TelegramClient, conn, event: events.NewMessage.Event) -> None:
     msg: Message = event.message
     chat = await event.get_chat()
@@ -436,58 +444,52 @@ async def summarize_daily(category: str, day: str, rows: list[Any], filtered_ads
         return None
 
     category_label = DAILY_CATEGORY_LABEL.get(category, category)
+    try:
+        display_day = datetime.strptime(day, "%Y-%m-%d").strftime("%d.%m")
+    except ValueError:
+        display_day = day
     prompt = f"""
-Сделай редакторский дайджест для владельца/менеджера маркетплейсов по постам Telegram за день.
+Сделай редакторский дайджест новостей для владельца/менеджера маркетплейсов.
 
-Твоя задача — НЕ пересказать все посты, а выбрать самое важное по приоритету.
-Перед ответом мысленно оцени каждый пост:
-3 — срочно/важно: изменения правил, сроки, штрафы, блокировки, комиссии, поставки, реклама, деньги, новые инструменты, крупные сбои.
-2 — полезно: практический кейс, цифры, наблюдение, которое можно применить.
-1 — слабый сигнал: мнение, мелкий кейс, частная история без проверяемого факта.
-0 — шум: повторы, самопиар, эмоции, вода, нерелевантное.
+Нужен формат как у живого новостного редактора: не таблица, не список всех постов,
+а короткая лента самых важных событий с поясняющими подпунктами.
 
-В итог включай только приоритет 2-3. Приоритет 0-1 не расписывай, считай в "Не вошло".
-Если важных пунктов мало — лучше короткая сводка, чем пересказ всего подряд.
+Оцени каждый пост:
+3 — важно/срочно: правила, сроки, штрафы, блокировки, комиссии, поставки, реклама, деньги, новые инструменты, крупные изменения.
+2 — полезно: применимый кейс, цифры, тарифы, наблюдение или лайфхак для селлера.
+1 — слабый сигнал: мнение, частная история, обсуждение без нового факта.
+0 — шум: повторы, самопиар, анонсы эфиров/курсов, опросы, эмоции, нерелевантное.
 
-Строго используй такой формат:
+В итог включай только приоритет 2-3. Приоритет 0-1 не расписывай.
+Если важных новостей мало — сделай короткий дайджест, не добивай объемом.
 
-🧾 МП-сводка за день
+Строгий формат ответа:
 
-🔥 Главное:
-1. ...
-2. ...
-3. ...
+📋 Дайджест новостей за {display_day}:
 
-🔴 Требует действия:
-— ...
+🖇Короткий заголовок новости (https://source/link)
 
-🟡 Важно знать:
-— ...
+-Что изменилось или произошло.
 
-🧪 Гипотезы для проверки:
-— ...
+-Что важно знать селлеру: сроки, суммы, условия, ограничения, последствия.
 
-🟢 Лайфхаки и полезные наблюдения:
-— ...
+-Что стоит сделать или проверить, если из новости следует действие.
 
-📌 Не вошло:
-Повторы — N
-Мнения без фактов — N
-Реклама/самопиар — {filtered_ads}
-Мелкие/низкоприоритетные посты — N, сохранены в архив
+🖇Следующая важная новость (https://source/link)
 
-Правила:
-- Пиши по-русски, коротко и по делу.
-- В "Главное" дай максимум 5-7 пунктов, отсортированных по важности.
-- Каждый важный пункт должен объяснять "что произошло" и "почему это важно селлеру".
-- В "Требует действия" добавляй только то, где селлеру реально нужно что-то сделать или проверить.
-- В "Гипотезы для проверки" пиши идеи, которые можно протестировать в магазине/рекламе/контенте. Помечай их как гипотезы, не как факты.
-- В "Лайфхаки" добавляй только применимые приемы, выводы или наблюдения из постов.
-- Если в разделе нечего писать, поставь "— нет".
-- Не включай в итог пост только потому, что он есть в списке.
-- Не придумывай факты, цифры, сроки и выводы. Не используй markdown.
-- Для важных пунктов по возможности добавляй ссылку на источник в конце: (источник: https://t.me/channel/123).
-- Считай "Повторы", "Мнения без фактов" и "Мелкие/низкоприоритетные посты" по переданным постам приблизительно.
+-...
+
+Правила оформления:
+- Без markdown, без жирного текста, без HTML.
+- Один важный инфоповод = один блок.
+- Заголовок начинай с 🖇, а особо денежные/практичные штуки можно начать с 👍.
+- Ссылку ставь прямо в заголовок в скобках. Если ссылки нет в посте, используй ссылку Telegram-источника вида https://t.me/channel/123.
+- Под каждым заголовком дай 1-4 подпункта через дефис, как в примере.
+- Не пиши разделы "Главное", "Важно знать", "Гипотезы", "Не вошло".
+- Не добавляй в дайджест рекламу, самопиар, опросы, анонсы вебинаров, мнения без фактов и мелкие истории без вывода.
+- Не придумывай факты, цифры, сроки, причины и выводы. Если детали нет в постах — не добавляй ее.
+- Сортируй новости по важности для селлера.
+- Максимум 8-10 блоков, лучше меньше.
 
 Категория: {category_label}
 Дата сбора: {day}
@@ -524,50 +526,30 @@ def build_daily_digest_text(
 ) -> str:
     daily_cfg = CFG.get("daily_digest", {})
     max_links = int(daily_cfg.get("max_source_links", 25))
-    category_label = DAILY_CATEGORY_LABEL.get(category, category)
+    try:
+        display_day = datetime.strptime(day, "%Y-%m-%d").strftime("%d.%m")
+    except ValueError:
+        display_day = day
 
     if summary:
-        parts = [html.escape(summary)]
+        return html.escape(summary)
     else:
         parts = [
-            "<b>🧾 МП-сводка за день</b>",
-            f"<i>{html.escape(category_label)} · {html.escape(day)}</i>",
-            "",
-            "<b>🔥 Главное:</b>",
+            f"📋 Дайджест новостей за {html.escape(display_day)}:",
         ]
         for i, r in enumerate(rows[:8], 1):
+            source = str(r["source"]).strip().lstrip("@")
+            link = f"https://t.me/{source}/{r['msg_id']}"
             snippet = str(r["text"]).replace("\n", " ").strip()
             if len(snippet) > 220:
                 snippet = snippet[:220].rsplit(" ", 1)[0].strip() + "..."
-            parts.append(f"{i}. @{html.escape(str(r['source']))} — {html.escape(snippet)}")
+            parts.append("")
+            parts.append(f"🖇@{html.escape(source)} ({link})")
+            parts.append(f"-{html.escape(snippet)}")
         parts.extend([
             "",
-            "<b>🔴 Требует действия:</b>",
-            "— проверь источники ниже и выбери, что важно для твоих товаров",
-            "",
-            "<b>🟡 Важно знать:</b>",
-            f"— за день собрано {len(rows)} постов",
-            "",
-            "<b>🧪 Гипотезы для проверки:</b>",
-            "— нет: AI-сводка не сформировалась",
-            "",
-            "<b>🟢 Лайфхаки и полезные наблюдения:</b>",
-            "— AI-сводка не сформировалась, поэтому показываю короткий архив самых свежих постов",
-            "",
-            "<b>📌 Не вошло:</b>",
-            "Повторы — 0",
-            "Мнения без фактов — 0",
-            f"Реклама/самопиар — {filtered_ads}",
-            "Мелкие/низкоприоритетные посты — 0, сохранены в архив",
+            f"Реклама/самопиар отфильтрованы до дайджеста: {filtered_ads}",
         ])
-
-    if summary:
-        source_lines = [
-            "",
-            "<b>🔗 Архив:</b>",
-            f"Обработано {len(rows)} постов. Низкоприоритетное не раскрываю в дайджесте.",
-        ]
-    else:
         source_lines = ["", "<b>🔗 Источники:</b>"]
         for r in rows[:max_links]:
             source = str(r["source"]).strip().lstrip("@")
@@ -712,6 +694,10 @@ async def daily_digest_worker(out_bot: Bot, client: TelegramClient, conn) -> Non
 
             for cat in ("mp_news", "marketing"):
                 bucket = daily_bucket(day, cat)
+                category_done_key = daily_digest_done_key(day, cat, send_hour)
+                if st.setting_get(conn, category_done_key) == setting_key:
+                    continue
+
                 rows = st.list_bucket(conn, bucket)
                 if not rows:
                     continue
@@ -731,14 +717,27 @@ async def daily_digest_worker(out_bot: Bot, client: TelegramClient, conn) -> Non
                         sent = False
                         break
 
-                admin_copies = await send_to_admins(out_bot, conn, text)
-
                 if sent:
+                    admin_copies = await send_to_admins(out_bot, conn, text)
                     st.delete_bucket(conn, bucket)
                     st.bump_stat(conn, day, cat, "sent_daily_digest")
+                    st.setting_set(conn, category_done_key, setting_key)
                     log.info("daily_digest %s %s: %d posts, admin copies: %d", cat, day, len(rows), admin_copies)
                 else:
                     all_sent = False
+                    fail_key = daily_digest_fail_notice_key(day, cat, send_hour)
+                    if st.setting_get(conn, fail_key) != setting_key:
+                        label = DAILY_CATEGORY_LABEL.get(cat, cat)
+                        await send_to_admins(
+                            out_bot,
+                            conn,
+                            (
+                                f"⚠️ Утренний дайджест за {day} по категории {label} не отправился "
+                                "в целевой чат/тему. Очередь сохранена, полный дайджест админам повторно "
+                                "не рассылаю, чтобы не спамить. Проверь /here, права бота и /health."
+                            ),
+                        )
+                        st.setting_set(conn, fail_key, setting_key)
 
             if not any_pending or all_sent:
                 st.setting_set(conn, "last_daily_digest", setting_key)
