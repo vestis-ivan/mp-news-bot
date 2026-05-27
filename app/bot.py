@@ -137,7 +137,7 @@ async def ai_is_ad(text: str) -> bool:
         return False
 
 
-async def ai_classify_post(text: str) -> str:
+async def ai_classify_post(text: str, category: str | None = None) -> str:
     ai_filter = CFG.get("filter", {}).get("ai_ad_filter", {})
     if not ai or not ai_filter.get("enabled", False):
         return "KEEP"
@@ -148,6 +148,18 @@ async def ai_classify_post(text: str) -> str:
 
     max_chars = int(ai_filter.get("max_chars", 2500))
     sample = sample[:max_chars]
+
+    category_rule = ""
+    if category == "marketing":
+        category_rule = (
+            "For category MARKETING, KEEP only posts directly about marketplace marketing: "
+            "ads, promotion tools, ad tariffs, campaign analytics, traffic, SEO/search ranking, "
+            "content/creative, cards conversion, discounts/promos affecting demand, external traffic, "
+            "brand communication, retention, marketplaces ad cabinets. "
+            "Return NOISE for corporate finance, M&A, bank partnerships, investments, marketplace politics, "
+            "generic WB/Ozon business news, logistics, warehouses, commissions, legal changes, or fintech news "
+            "unless the post gives a direct marketing action for sellers. "
+        )
 
     try:
         resp = await ai.chat.completions.create(
@@ -164,6 +176,7 @@ async def ai_classify_post(text: str) -> str:
                         "giveaways, livestream announcements, calls to register/contact/buy/subscribe. "
                         "NOISE: opinions without facts, polls, jokes, personal stories, vague motivation, "
                         "minor cases without useful lesson, repeated discussion prompts. "
+                        f"{category_rule}"
                         "If unsure between KEEP and NOISE, choose KEEP only when there is a concrete fact "
                         "or applicable seller insight."
                     ),
@@ -360,7 +373,7 @@ async def handle_message_from_chat(out_bot: Bot, client: TelegramClient, conn, m
         st.bump_source_stat(conn, day, username, ch.category, "skipped_empty")
         return
 
-    classification = await ai_classify_post(cleaned)
+    classification = await ai_classify_post(cleaned, ch.category)
     if classification == "AD":
         log.info("[%s/%d] ai-ad -> skip", username, msg.id)
         st.bump_stat(conn, day, ch.category, "blocked_ai_ad")
@@ -448,6 +461,20 @@ async def summarize_daily(category: str, day: str, rows: list[Any], filtered_ads
         display_day = datetime.strptime(day, "%Y-%m-%d").strftime("%d.%m")
     except ValueError:
         display_day = day
+    if category == "marketing":
+        category_focus = """
+Фокус категории "Маркетинг":
+- Это НЕ общий дайджест маркетплейсов. Включай только то, что напрямую помогает продвигать товары и управлять спросом.
+- Подходящие темы: реклама Ozon/WB, ставки и аукцион, продвижение, внешняя реклама, SEO/поиск, карточки и контент, CTR/CVR, отзывы как фактор конверсии, акции, промо, скидки, трафик, аналитика рекламных кампаний, креативы, инструменты маркетинга.
+- Не включай: ВТБ покупает долю WB, ЦФА/инвестиции, банк/финтех WB, корпоративные сделки, логистика, склады, возвраты, комиссии, штрафы, законодательство, если там нет прямого маркетингового действия.
+- Если в очереди нет сильных маркетинговых новостей, напиши коротко: "За период важных маркетинговых новостей не найдено." Не заменяй их общими новостями WB/Ozon.
+""".strip()
+    else:
+        category_focus = """
+Фокус категории "MP-новости":
+- Включай важные новости Ozon/WB и других маркетплейсов: правила, комиссии, логистика, карточки, реклама, штрафы, кабинеты, сроки, инструменты и официальные изменения.
+- Отдельные корпоративные/финансовые новости включай только если они могут повлиять на селлеров практически.
+""".strip()
     prompt = f"""
 Сделай редакторский дайджест новостей для владельца/менеджера маркетплейсов.
 
@@ -462,6 +489,8 @@ async def summarize_daily(category: str, day: str, rows: list[Any], filtered_ads
 
 В итог включай только приоритет 2-3. Приоритет 0-1 не расписывай.
 Если важных новостей мало — сделай короткий дайджест, не добивай объемом.
+
+{category_focus}
 
 Приоритет площадок:
 - Ozon — главный фокус дайджеста. При прочих равных выбирай новости Ozon выше WB.
