@@ -140,10 +140,14 @@ Admin commands:
 
 ```text
 /runjob                    # preview today's digest to admins, queue stays
+/runjob marketing          # preview only marketing
 /runjob today
 /runjob yesterday
 /runjob 2026-05-25
+/runjob yesterday marketing # preview marketing for a day
 /runjob send               # send today's digest to target chat, queue still stays
+/runjob send marketing     # send only marketing to target chat
+/runjob send marketing 2026-05-25 # send marketing for a date
 /queue today all           # show daily queue
 /queue today all quarantine # show filtered ads/noise
 /sources 7                 # source quality for 7 days

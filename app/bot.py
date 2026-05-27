@@ -463,6 +463,13 @@ async def summarize_daily(category: str, day: str, rows: list[Any], filtered_ads
 В итог включай только приоритет 2-3. Приоритет 0-1 не расписывай.
 Если важных новостей мало — сделай короткий дайджест, не добивай объемом.
 
+Приоритет площадок:
+- Ozon — главный фокус дайджеста. При прочих равных выбирай новости Ozon выше WB.
+- Если за день есть достаточно важных новостей Ozon, дай им примерно 60-70% блоков.
+- WB тоже включай, но только самые важные изменения: правила, тарифы, логистика, штрафы, карточки, реклама, официальные новости.
+- Не выкидывай критически важный WB ради слабой новости Ozon. Важность факта важнее бренда, но при равной важности побеждает Ozon.
+- Новости не про Ozon/WB включай только если они прямо важны селлерам маркетплейсов.
+
 Строгий формат ответа:
 
 📋 Дайджест новостей за {display_day}:
@@ -582,6 +589,49 @@ def resolve_runjob_day(conn, raw: str | None) -> str:
     return today.isoformat()
 
 
+def parse_runjob_args(conn, raw: str | None) -> tuple[bool, str, str | None]:
+    tokens = (raw or "").strip().split()
+    send_target = False
+    day_arg: str | None = None
+    category: str | None = None
+
+    category_aliases: dict[str, str | None] = {
+        "all": None,
+        "все": None,
+        "mp": "mp_news",
+        "мп": "mp_news",
+        "news": "mp_news",
+        "новости": "mp_news",
+        "mp_news": "mp_news",
+        "marketing": "marketing",
+        "market": "marketing",
+        "mkt": "marketing",
+        "маркетинг": "marketing",
+    }
+
+    for token in tokens:
+        value = token.strip().lower()
+        if value in ("send", "отправить"):
+            send_target = True
+            continue
+        if value in ("preview", "превью"):
+            send_target = False
+            continue
+        if value in category_aliases:
+            category = category_aliases[value]
+            continue
+        if day_arg is None:
+            day_arg = token
+            continue
+        raise ValueError(
+            "Не понял аргументы. Примеры: /runjob, /runjob marketing, "
+            "/runjob send marketing, /runjob yesterday mp_news, "
+            "/runjob send marketing 2026-05-25."
+        )
+
+    return send_target, resolve_runjob_day(conn, day_arg), category
+
+
 async def run_daily_digest_once(
     out_bot: Bot,
     client: TelegramClient,
@@ -593,6 +643,7 @@ async def run_daily_digest_once(
     consume: bool = True,
     send_target: bool = True,
     send_admins_copy: bool = True,
+    category: str | None = None,
 ) -> str:
     daily_cfg = CFG.get("daily_digest", {})
     if not daily_cfg.get("enabled", True) and not force:
@@ -610,13 +661,15 @@ async def run_daily_digest_once(
     any_pending = False
     all_sent = True
     mode = "отправка" if send_target else "предпросмотр"
-    result_lines = [f"✅ Ручной запуск сводки за {day}: {mode}"]
+    categories = (category,) if category in ("mp_news", "marketing") else ("mp_news", "marketing")
+    category_label = DAILY_CATEGORY_LABEL.get(category, "все категории") if category else "все категории"
+    result_lines = [f"✅ Ручной запуск сводки за {day}: {mode}, {category_label}"]
     if not consume:
         result_lines.append("Очередь не очищается: утренний дайджест в 09:00 МСК соберет полный день.")
     if not send_target:
         result_lines.append("В целевой канал не отправляю: это preview для админов.")
 
-    for cat in ("mp_news", "marketing"):
+    for cat in categories:
         bucket = daily_bucket(day, cat)
         rows = st.list_bucket(conn, bucket)
         label = DAILY_CATEGORY_LABEL.get(cat, cat)
@@ -978,18 +1031,7 @@ async def main() -> None:
 
     # Конкурентные таски
     async def _runjob(raw_day: str | None = None) -> str:
-        raw = (raw_day or "").strip()
-        parts = raw.split()
-        send_target = False
-        day_arg: str | None = raw or None
-        if parts and parts[0].lower() in ("send", "отправить"):
-            send_target = True
-            day_arg = " ".join(parts[1:]) or None
-        elif parts and parts[0].lower() in ("preview", "превью"):
-            send_target = False
-            day_arg = " ".join(parts[1:]) or None
-
-        day = resolve_runjob_day(conn, day_arg)
+        send_target, day, category = parse_runjob_args(conn, raw_day)
         return await run_daily_digest_once(
             out_bot,
             client,
@@ -1000,6 +1042,7 @@ async def main() -> None:
             consume=False,
             send_target=send_target,
             send_admins_copy=True,
+            category=category,
         )
 
     async def _health_check() -> str:

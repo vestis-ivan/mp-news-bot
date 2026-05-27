@@ -30,7 +30,11 @@
 | `/list [mp_news\|marketing]` | список каналов, с инлайн-меню |
 | `/stats` | статистика за сегодня и вчера |
 | `/runjob` | preview дайджеста админам, очередь не очищается |
+| `/runjob marketing` | preview только маркетинга |
+| `/runjob yesterday marketing` | preview категории за дату/день |
 | `/runjob send` | отправить дайджест в целевой чат, очередь не очищается |
+| `/runjob send marketing` | отправить только маркетинг |
+| `/runjob send marketing 2026-05-25` | отправить категорию за дату |
 | `/queue today all` | посмотреть накопленные посты |
 | `/queue today all quarantine` | посмотреть отсеянное |
 | `/clearqueue today all` | вручную очистить очередь |
