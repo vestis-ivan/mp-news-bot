@@ -232,6 +232,11 @@ def get_target(conn: sqlite3.Connection, category: str) -> tuple[int, int | None
     return r["chat_id"], r["thread_id"]
 
 
+def remove_target(conn: sqlite3.Connection, category: str) -> bool:
+    cur = conn.execute("DELETE FROM targets WHERE category = ?", (category,))
+    return cur.rowcount > 0
+
+
 # ---------- admins ------------------------------------------------------------
 
 def add_admin(conn: sqlite3.Connection, user_id: int, username: str | None, first_name: str | None) -> bool:

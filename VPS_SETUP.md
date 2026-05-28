@@ -148,6 +148,8 @@ Admin commands:
 /runjob send               # send today's digest to target chat, queue still stays
 /runjob send marketing     # send only marketing to target chat
 /runjob send marketing 2026-05-25 # send marketing for a date
+/hereremove marketing      # remove marketing target
+/hereremove all            # remove all targets
 /queue today all           # show daily queue
 /queue today all quarantine # show filtered ads/noise
 /sources 7                 # source quality for 7 days
@@ -169,6 +171,8 @@ channel_three
 ```
 
 Every digest is sent to the configured `/here` target and copied to all approved admins.
+If a digest is longer than Telegram's message limit, all parts are sent to the target chat/topic.
+If `/here marketing` is set in the same chat/topic where `/here mp_news` used to point, the old MP target is removed automatically to avoid mixing categories.
 
 ## 7. Update after replacing files
 

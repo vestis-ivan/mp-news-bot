@@ -411,14 +411,54 @@ def build_router(
             )
             return
         thread_id = msg.message_thread_id  # для топиков в супергруппе
+        other = "marketing" if arg == "mp_news" else "mp_news"
+        other_target = st.get_target(conn, other)
+        removed_other = False
         st.set_target(conn, arg, msg.chat.id, thread_id, msg.from_user.id)
+        if other_target == (msg.chat.id, thread_id):
+            removed_other = st.remove_target(conn, other)
         where = f"чат <b>{msg.chat.title or msg.chat.id}</b>"
         if thread_id:
             where += f" / тема #{thread_id}"
+        extra = ""
+        if removed_other:
+            extra = (
+                f"\n\n⚠️ Старый приёмник для <b>{CATEGORY_LABEL[other]}</b> был в этом же месте, "
+                "я его снял, чтобы MP и маркетинг не смешивались."
+            )
         await msg.answer(
             f"✅ Приёмник для <b>{CATEGORY_LABEL[arg]}</b> назначен сюда: {where}.\n\n"
             "Все новые посты этой категории будут лететь в этот чат/тему."
+            f"{extra}"
         )
+
+    @r.message(Command("hereremove", "removehere"))
+    async def cmd_here_remove(msg: Message, command: CommandObject):
+        if not await check(msg):
+            return
+        arg = (command.args or "").strip().lower()
+        if arg not in ("mp_news", "marketing", "all", "все"):
+            await msg.answer(
+                "Использование: <code>/hereremove mp_news</code>, "
+                "<code>/hereremove marketing</code> или <code>/hereremove all</code>"
+            )
+            return
+
+        cats = ("mp_news", "marketing") if arg in ("all", "все") else (arg,)
+        removed: list[str] = []
+        missing: list[str] = []
+        for cat in cats:
+            if st.remove_target(conn, cat):
+                removed.append(CATEGORY_LABEL[cat])
+            else:
+                missing.append(CATEGORY_LABEL[cat])
+
+        lines = []
+        if removed:
+            lines.append("✅ Снял приёмник:\n" + "\n".join(f"— {x}" for x in removed))
+        if missing:
+            lines.append("ℹ️ Не был задан:\n" + "\n".join(f"— {x}" for x in missing))
+        await msg.answer("\n\n".join(lines), reply_markup=main_menu_kb())
 
     @r.message(Command("add"))
     async def cmd_add(msg: Message, command: CommandObject):
@@ -1011,7 +1051,8 @@ def build_router(
                 lines.append(f"{CATEGORY_LABEL[cat]}: ❌ не задан (используй /here)")
         lines.append(
             "\nЧтобы задать приёмник — зайди в нужный чат/тему и напиши там:\n"
-            "<code>/here mp_news</code> или <code>/here marketing</code>"
+            "<code>/here mp_news</code> или <code>/here marketing</code>\n"
+            "Чтобы снять — <code>/hereremove mp_news</code>, <code>/hereremove marketing</code> или <code>/hereremove all</code>"
         )
         await c.message.edit_text("\n".join(lines), reply_markup=main_menu_kb())
         await c.answer()
@@ -1025,6 +1066,7 @@ def build_router(
             "<code>/menu</code> — главное меню\n"
             "<code>/here mp_news</code> — назначить ЭТОТ чат/тему как приёмник\n"
             "<code>/here marketing</code> — то же для маркетинга\n"
+            "<code>/hereremove mp_news|marketing|all</code> — снять приёмник\n"
             "<code>/add @username mp_news|marketing</code>\n"
             "<code>/addlist mp_news</code> + список каналов строками\n"
             "<code>/remove @username</code>\n"

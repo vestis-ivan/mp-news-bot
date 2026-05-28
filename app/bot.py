@@ -276,6 +276,25 @@ async def send_to_target(
         return False
 
 
+async def send_text_to_target(
+    out_bot: Bot,
+    client: TelegramClient,
+    conn,
+    category: str,
+    text: str,
+) -> tuple[bool, int, int]:
+    chunks = chunk_text(text, 3900)
+    if not chunks:
+        return True, 0, 0
+
+    sent = 0
+    for chunk in chunks:
+        if not await send_to_target(out_bot, client, conn, category, text=chunk):
+            return False, sent, len(chunks)
+        sent += 1
+    return True, sent, len(chunks)
+
+
 # ---------- Обработка нового сообщения ----------------------------------------
 
 async def send_to_admins(out_bot: Bot, conn, text: str) -> int:
@@ -525,7 +544,8 @@ async def summarize_daily(category: str, day: str, rows: list[Any], filtered_ads
 - Не добавляй в дайджест рекламу, самопиар, опросы, анонсы вебинаров, мнения без фактов и мелкие истории без вывода.
 - Не придумывай факты, цифры, сроки, причины и выводы. Если детали нет в постах — не добавляй ее.
 - Сортируй новости по важности для селлера.
-- Максимум 8-10 блоков, лучше меньше.
+- Включай все важные новости приоритета 2-3, которые есть в очереди. Не ограничивайся одним сообщением: бот сам разобьет длинный дайджест на несколько сообщений.
+- Если важных новостей много, максимум 20-25 блоков. Если важных мало, лучше коротко.
 
 Категория: {category_label}
 Дата сбора: {day}
@@ -717,29 +737,33 @@ async def run_daily_digest_once(
         text = build_daily_digest_text(cat, day, rows, summary, filtered_ads)
 
         target_sent = True
+        target_chunks = 0
+        target_total_chunks = 0
         if send_target:
-            for chunk in chunk_text(text, 4000):
-                if not await send_to_target(out_bot, client, conn, cat, text=chunk):
-                    target_sent = False
-                    break
+            target_sent, target_chunks, target_total_chunks = await send_text_to_target(
+                out_bot, client, conn, cat, text
+            )
 
         admin_copies = await send_to_admins(out_bot, conn, text) if send_admins_copy else 0
+        target_note = ""
+        if send_target:
+            target_note = f", частей в целевой чат {target_chunks}/{target_total_chunks}"
 
         if target_sent:
             if consume:
                 st.delete_bucket(conn, bucket)
                 st.bump_stat(conn, day, cat, "sent_daily_digest")
-                result_lines.append(f"{label}: отправлено {len(rows)} постов, очередь очищена, копий админам {admin_copies}")
+                result_lines.append(f"{label}: отправлено {len(rows)} постов, очередь очищена{target_note}, копий админам {admin_copies}")
             elif not send_target:
                 st.bump_stat(conn, day, cat, "preview_digest")
                 result_lines.append(f"{label}: preview собран по {len(rows)} постам, очередь сохранена, копий админам {admin_copies}")
             else:
                 st.bump_stat(conn, day, cat, "sent_manual_digest")
-                result_lines.append(f"{label}: отправлено {len(rows)} постов, очередь сохранена, копий админам {admin_copies}")
+                result_lines.append(f"{label}: отправлено {len(rows)} постов, очередь сохранена{target_note}, копий админам {admin_copies}")
             log.info("daily_digest %s %s: %d posts, consume=%s", cat, day, len(rows), consume)
         else:
             all_sent = False
-            result_lines.append(f"{label}: не удалось отправить в целевой чат, очередь сохранена; копий админам {admin_copies}")
+            result_lines.append(f"{label}: не удалось отправить все части в целевой чат ({target_chunks}/{target_total_chunks}), очередь сохранена; копий админам {admin_copies}")
 
     if mark_schedule and (not any_pending or all_sent):
         st.setting_set(conn, "last_daily_digest", setting_key)
@@ -793,18 +817,19 @@ async def daily_digest_worker(out_bot: Bot, client: TelegramClient, conn) -> Non
                     continue
                 text = build_daily_digest_text(cat, day, rows, summary, filtered_ads)
 
-                sent = True
-                for chunk in chunk_text(text, 4000):
-                    if not await send_to_target(out_bot, client, conn, cat, text=chunk):
-                        sent = False
-                        break
+                sent, target_chunks, target_total_chunks = await send_text_to_target(
+                    out_bot, client, conn, cat, text
+                )
 
                 if sent:
                     admin_copies = await send_to_admins(out_bot, conn, text)
                     st.delete_bucket(conn, bucket)
                     st.bump_stat(conn, day, cat, "sent_daily_digest")
                     st.setting_set(conn, category_done_key, setting_key)
-                    log.info("daily_digest %s %s: %d posts, admin copies: %d", cat, day, len(rows), admin_copies)
+                    log.info(
+                        "daily_digest %s %s: %d posts, target chunks: %d/%d, admin copies: %d",
+                        cat, day, len(rows), target_chunks, target_total_chunks, admin_copies,
+                    )
                 else:
                     all_sent = False
                     fail_key = daily_digest_fail_notice_key(day, cat, send_hour)
