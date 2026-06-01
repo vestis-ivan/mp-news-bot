@@ -740,6 +740,77 @@ def vc_payload(items: list[dict[str, Any]], max_chars: int = 18000) -> str:
     return "\n---\n".join(parts)
 
 
+def _parse_ai_json_object(text: str) -> dict[str, Any] | None:
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+        text = re.sub(r"\s*```$", "", text).strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            data = json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+    return data if isinstance(data, dict) else None
+
+
+def _render_vc_digest(day: str, items: list[dict[str, Any]], ai_data: dict[str, Any]) -> str | None:
+    by_id = {int(item["id"]): item for item in items}
+    raw_items = ai_data.get("items")
+    if not isinstance(raw_items, list):
+        return None
+
+    try:
+        display_day = datetime.strptime(day, "%Y-%m-%d").strftime("%d.%m")
+    except ValueError:
+        display_day = day
+
+    blocks = [f"📋 VC.ru: важное про Ozon/WB за {display_day}"]
+    added = 0
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            item_id = int(raw.get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        source = by_id.get(item_id)
+        if not source:
+            continue
+
+        theses = raw.get("theses")
+        if not isinstance(theses, list):
+            continue
+        clean_theses = [strip_html_text(str(t)).strip(" -\n\t") for t in theses if str(t).strip()]
+        clean_theses = [t for t in clean_theses if len(t) >= 20]
+        if len(clean_theses) < 3:
+            continue
+
+        title = strip_html_text(str(raw.get("title") or source["title"])).strip()
+        if not title:
+            title = str(source["title"]).strip() or "Материал vc.ru"
+        url = str(source["url"])
+        block = [
+            f"🖇{title} ({url})",
+            f"- {clean_theses[0]}",
+            f"- {clean_theses[1]}",
+            f"- {clean_theses[2]}",
+        ]
+        blocks.append("\n\n".join(block))
+        added += 1
+        if added >= 8:
+            break
+
+    if not added:
+        return None
+    return "\n\n".join(blocks)
+
+
 async def summarize_vc_digest(day: str, items: list[dict[str, Any]]) -> str | None:
     if not ai or not items:
         return None
@@ -752,34 +823,39 @@ async def summarize_vc_digest(day: str, items: list[dict[str, Any]]) -> str | No
         display_day = day
 
     prompt = f"""
-Сделай отдельный дайджест по материалам vc.ru для селлера маркетплейсов.
+Выбери важные материалы vc.ru для селлера маркетплейсов и верни JSON.
 Не пересказывай "о чём статья". Нужна суть: конкретные факты, последствия и что селлеру стоит проверить.
 
 Главный фокус — Ozon. Wildberries можно добавить немного, только если новость реально важная.
 Не включай пользовательские жалобы, бытовые кейсы покупателей, инвестиционные заметки, рекламу услуг,
 общие рассуждения без фактов и материалы не для селлеров.
 
-Если среди материалов нет важных новостей для селлера Ozon/WB, верни ровно: NO_IMPORTANT
+Если среди материалов нет важных новостей для селлера Ozon/WB, верни:
+{{"items":[]}}
 
-Формат:
-
-📋 VC.ru: важное про Ozon/WB за {display_day}
-
-🖇Короткий заголовок (https://vc.ru/...)
-
-- Тезис 1: главный факт или изменение из материала.
-
-- Тезис 2: почему это важно для селлера Ozon/WB, какие риски или возможности появляются.
-
-- Тезис 3: что проверить, сделать или какую гипотезу можно рассмотреть.
+Формат ответа строго JSON без markdown:
+{{
+  "items": [
+    {{
+      "id": 123,
+      "title": "Короткий заголовок",
+      "theses": [
+        "Главный факт или изменение из материала.",
+        "Почему это важно для селлера Ozon/WB: риск, возможность или влияние на деньги/операции.",
+        "Что проверить, сделать или какую гипотезу можно рассмотреть."
+      ]
+    }}
+  ]
+}}
 
 Правила:
 - Ozon должен занимать примерно 70-80% дайджеста, если есть подходящие материалы.
 - WB добавляй только после Ozon и только важное.
-- Максимум 6-8 блоков.
-- В каждом блоке должно быть ровно 3 содержательных тезиса. Не пиши общие фразы вроде "в статье рассказывается".
+- Максимум 6-8 материалов.
+- В каждом материале должно быть ровно 3 содержательных тезиса.
+- Не пиши общие фразы вроде "в статье рассказывается", "обсуждаются причины", "описываются изменения".
 - Если в материале не хватает данных на 3 полезных тезиса для селлера, не включай этот материал.
-- Не используй markdown и HTML.
+- Используй только id материалов из списка ниже.
 - Не придумывай факты.
 
 Материалы:
@@ -790,16 +866,19 @@ async def summarize_vc_digest(day: str, items: list[dict[str, Any]]) -> str | No
         resp = await ai.chat.completions.create(
             model=CFG["ai"]["model"],
             messages=[
-                {"role": "system", "content": "Ты редактор отдельной сводки по vc.ru для селлеров Ozon/WB."},
+                {"role": "system", "content": "Ты редактор отдельной сводки по vc.ru для селлеров Ozon/WB. Отвечай только валидным JSON."},
                 {"role": "user", "content": prompt},
             ],
             max_tokens=int(CFG.get("vc_digest", {}).get("max_tokens", 1600)),
+            response_format={"type": "json_object"},
             temperature=0.2,
         )
         text = (resp.choices[0].message.content or "").strip()
-        if text.upper().startswith("NO_IMPORTANT"):
+        data = _parse_ai_json_object(text)
+        if not data:
+            log.warning("OpenAI vc digest returned non-json: %s", text[:300])
             return None
-        return text
+        return _render_vc_digest(day, items, data)
     except Exception as e:
         log.warning("OpenAI vc digest fail: %s", e)
         return None

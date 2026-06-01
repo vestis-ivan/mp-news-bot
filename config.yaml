@@ -30,7 +30,7 @@ vc_digest:
   send_minute_msk: 20
   max_age_hours: 72
   max_items: 30
-  max_tokens: 1600
+  max_tokens: 2400
   pages:
     - "https://vc.ru/marketplace"
     - "https://vc.ru/new"
