@@ -817,6 +817,10 @@ async def run_vc_digest_once(
     day = now.date().isoformat()
     send_hour = int(cfg.get("send_hour_msk", 9))
     send_minute = int(cfg.get("send_minute_msk", 20))
+    category = str(cfg.get("category", "mp_news"))
+    if send_target and not st.get_target(conn, category):
+        return f"❌ VC.ru-сводку не отправляю: нет целевого чата/темы для {category}. Задай /here {category}."
+
     setting_key = f"{day}:{send_hour}:{send_minute}"
     if not force and st.setting_get(conn, "last_vc_digest") == setting_key:
         return f"ℹ️ VC.ru-сводка за {day} уже была обработана."
@@ -838,7 +842,6 @@ async def run_vc_digest_once(
             st.setting_set(conn, "last_vc_digest_result", f"no important items, candidates={len(items)}")
         return f"ℹ️ VC.ru: кандидатов {len(items)}, но важных новостей для дайджеста AI не выбрал."
 
-    category = str(cfg.get("category", "mp_news"))
     sent = True
     chunks = 0
     total_chunks = 0
@@ -966,6 +969,12 @@ async def run_daily_digest_once(
             result_lines.append(f"{label}: очередь пустая")
             continue
 
+        if send_target and not st.get_target(conn, cat):
+            any_pending = True
+            all_sent = False
+            result_lines.append(f"{label}: нет целевого чата/темы. Задай /here {cat}, AI-сводку не собираю.")
+            continue
+
         any_pending = True
         filtered_ads = filtered_ad_count(day_stats, cat)
         summary = await summarize_daily(cat, day, rows, filtered_ads)
@@ -1048,6 +1057,23 @@ async def daily_digest_worker(out_bot: Bot, client: TelegramClient, conn) -> Non
 
                 rows = st.list_bucket(conn, bucket)
                 if not rows:
+                    continue
+
+                if not st.get_target(conn, cat):
+                    all_sent = False
+                    fail_key = daily_digest_fail_notice_key(day, cat, send_hour)
+                    if st.setting_get(conn, fail_key) != setting_key:
+                        label = DAILY_CATEGORY_LABEL.get(cat, cat)
+                        await send_to_admins(
+                            out_bot,
+                            conn,
+                            (
+                                f"⚠️ Утренний дайджест за {day} по категории {label} не отправился: "
+                                f"нет целевого чата/темы. Очередь сохранена, AI-сводку не собираю. "
+                                f"Задай /here {cat} в нужной теме."
+                            ),
+                        )
+                        st.setting_set(conn, fail_key, setting_key)
                     continue
 
                 any_pending = True
