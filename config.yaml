@@ -125,13 +125,36 @@ channels:
     - wbbillion
 
   marketing:
-    - redman
-    - target_i_pr
-    - PragmaticMarketingShkipin
-    - andrey_pro_business
-    - OsokinOsokin
-    - kudahiko
+    - teslatarget
+    - blogsmm
+    - MarketingPloy
+    - GuerrillaMarketing
+    - marketology24
+    - adindex
+    - smmrus
+    - marzaganoff
+    - dnative
+    - smmshit
+    - stashkevichyan
+    - wowreelsru
+    - FamilyBots
+    - marketingold
+    - idoras
+    - damirkhalilov
+    - instalova_viola
     - marketpsy
+    - Godketing
+    - mashapoluyanova
+    - popsmarketing
+    - maratyus
+    - sosicka
+    - petrochenkow
+    - costperlead
+    - martrending
+    - pressfeed
+    - smmplanner
+    - setters
+    - sostav
 
 # Особый режим (digest) — пишется в БД при засеве как mode=digest
 special:
