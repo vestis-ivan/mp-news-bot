@@ -324,6 +324,7 @@ def build_router(
     conn,
     bot: Bot,
     run_job: Callable[[str | None], Awaitable[str]] | None = None,
+    run_vc_job: Callable[[str | None], Awaitable[str]] | None = None,
     health_check: Callable[[], Awaitable[str]] | None = None,
     check_channels: Callable[[], Awaitable[str]] | None = None,
 ) -> Router:
@@ -676,6 +677,28 @@ def build_router(
         except Exception as e:
             log.exception("runjob fail: %s", e)
             await notice.edit_text(f"❌ Не получилось запустить сводку: {e}")
+        else:
+            await notice.edit_text(result)
+
+    @r.message(Command("runvc"))
+    async def cmd_runvc(msg: Message, command: CommandObject):
+        if not await check(msg):
+            return
+        if run_vc_job is None:
+            await msg.answer("❌ VC.ru-сводка не подключена в этом процессе.")
+            return
+        raw_args = (command.args or "").strip() or None
+        is_send = bool(raw_args and raw_args.split()[0].lower() in ("send", "отправить"))
+        notice = await msg.answer(
+            "⏳ Собираю и отправляю VC.ru-сводку в MP-чат..."
+            if is_send else
+            "⏳ Собираю preview VC.ru-сводки для админов без отправки в канал..."
+        )
+        try:
+            result = await run_vc_job(raw_args)
+        except Exception as e:
+            log.exception("runvc fail: %s", e)
+            await notice.edit_text(f"❌ Не получилось запустить VC.ru-сводку: {e}")
         else:
             await notice.edit_text(result)
 
@@ -1081,6 +1104,8 @@ def build_router(
             "<code>/runjob send</code> — отправить дайджест в целевой чат, очередь не очищается\n"
             "<code>/runjob send marketing</code> — отправить только маркетинг\n"
             "<code>/runjob send marketing 2026-05-25</code> — отправить категорию за дату\n"
+            "<code>/runvc</code> — preview отдельной VC.ru-сводки по Ozon/WB\n"
+            "<code>/runvc send</code> — отправить VC.ru-сводку в MP-чат\n"
             "<code>/queue today all</code> — посмотреть накопленные посты\n"
             "<code>/queue today all quarantine</code> — посмотреть отсеянное\n"
             "<code>/clearqueue today all</code> — очистить очередь вручную\n"
@@ -1090,7 +1115,7 @@ def build_router(
             "<code>/checkchannels</code> — проверить доступ к каналам\n"
             "<code>/catchup 36</code> — окно догоняющего сканера в часах\n"
             "<code>/cancel</code> — сбросить текущий ввод\n\n"
-            "💡 Бот копит посты весь день по московской дате и в 09:00-09:10 МСК отправляет сводку за вчера."
+            "💡 Бот копит посты весь день по московской дате и после 09:00 МСК отправляет сводку за вчера. VC.ru-сводка идёт отдельным сообщением после неё."
         )
         await c.message.edit_text(text, reply_markup=main_menu_kb())
         await c.answer()
@@ -1191,7 +1216,7 @@ def _stats_text(conn) -> str:
         f"🛒 MP: в очереди {q_yday_mp}, карантин {quarantine_yday_mp}, утренних сводок {cell(sy, 'mp_news', 'sent_daily_digest')}\n"
         f"📣 Маркетинг: в очереди {q_yday_m}, карантин {quarantine_yday_m}, утренних сводок {cell(sy, 'marketing', 'sent_daily_digest')}\n\n"
         "<b>Режим</b>\n"
-        "Бот копит посты весь день по московской дате и отправляет сводку за вчера только в окне 09:00-09:10 МСК."
+        "Бот копит посты весь день по московской дате и после 09:00 МСК отправляет сводку за вчера. Если 09:00 пропущены, он догонит позже."
     )
 
 
@@ -1199,6 +1224,7 @@ async def run_admin_bot(
     bot: Bot,
     conn,
     run_job: Callable[[str | None], Awaitable[str]] | None = None,
+    run_vc_job: Callable[[str | None], Awaitable[str]] | None = None,
     health_check: Callable[[], Awaitable[str]] | None = None,
     check_channels: Callable[[], Awaitable[str]] | None = None,
 ) -> None:
@@ -1209,6 +1235,7 @@ async def run_admin_bot(
             conn,
             bot,
             run_job=run_job,
+            run_vc_job=run_vc_job,
             health_check=health_check,
             check_channels=check_channels,
         )

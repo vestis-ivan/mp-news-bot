@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import logging
 import os
+import re
 import sqlite3
 import signal
 import sys
@@ -28,6 +30,7 @@ from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from dotenv import load_dotenv
+import httpx
 from openai import AsyncOpenAI
 from telethon import TelegramClient, events
 from telethon.tl.types import Channel, Chat, Message
@@ -617,6 +620,243 @@ def build_daily_digest_text(
     return "\n".join(parts + source_lines)
 
 
+def strip_html_text(value: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", value or "")
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def extract_vc_initial_state(page: str) -> dict[str, Any]:
+    m = re.search(r"window\.__INITIAL_STATE__\s*=\s*({[\s\S]*?});\s*</script>", page)
+    if not m:
+        return {}
+    try:
+        return json.loads(m.group(1))
+    except Exception as e:
+        log.warning("vc.ru initial state parse fail: %s", e)
+        return {}
+
+
+def vc_entry_text(entry: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for block in entry.get("blocks") or []:
+        data = block.get("data") or {}
+        for key in ("text", "subline1", "subline2"):
+            value = data.get(key)
+            if isinstance(value, str):
+                cleaned = strip_html_text(value)
+                if cleaned:
+                    parts.append(cleaned)
+    return "\n".join(parts)
+
+
+def vc_keyword_score(text: str) -> int:
+    low = text.lower()
+    ozon = any(x in low for x in ("ozon", "озон", "oзон"))
+    wb = any(x in low for x in ("wildberries", "вайлдберриз", "wb ", " wb", "вб ", " вб"))
+    if ozon and wb:
+        return 3
+    if ozon:
+        return 2
+    if wb:
+        return 1
+    return 0
+
+
+async def fetch_vc_candidates(max_age_hours: float, max_items: int) -> list[dict[str, Any]]:
+    cfg = CFG.get("vc_digest", {})
+    pages = cfg.get("pages") or ["https://vc.ru/marketplace", "https://vc.ru/new", "https://vc.ru/popular"]
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    seen_ids: set[int] = set()
+    out: list[dict[str, Any]] = []
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; MPNewsBot/1.0; +https://vc.ru)",
+        "Accept": "text/html,application/xhtml+xml",
+    }
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers=headers) as http:
+        for page_url in pages:
+            try:
+                resp = await http.get(page_url)
+                resp.raise_for_status()
+            except Exception as e:
+                log.warning("vc.ru fetch fail %s: %s", page_url, e)
+                continue
+
+            state = extract_vc_initial_state(resp.text)
+            for key, feed in state.items():
+                if not key.startswith("feed@") or not isinstance(feed, dict):
+                    continue
+                for item in feed.get("items") or []:
+                    if item.get("type") != "entry":
+                        continue
+                    data = item.get("data") or {}
+                    item_id = int(data.get("id") or 0)
+                    if not item_id or item_id in seen_ids:
+                        continue
+                    published = datetime.fromtimestamp(int(data.get("date") or 0), timezone.utc)
+                    if published < cutoff:
+                        continue
+                    title = strip_html_text(str(data.get("title") or ""))
+                    body = vc_entry_text(data)
+                    score = vc_keyword_score(f"{title}\n{body}")
+                    if not score:
+                        continue
+                    seen_ids.add(item_id)
+                    url = data.get("url") or data.get("uri") or f"https://vc.ru/{item_id}"
+                    if isinstance(url, str) and url.startswith("/"):
+                        url = f"https://vc.ru{url}"
+                    out.append({
+                        "id": item_id,
+                        "url": str(url),
+                        "title": title,
+                        "text": body,
+                        "date": published,
+                        "score": score,
+                    })
+
+    out.sort(key=lambda x: (x["score"], x["date"]), reverse=True)
+    return out[:max_items]
+
+
+def vc_payload(items: list[dict[str, Any]], max_chars: int = 18000) -> str:
+    parts: list[str] = []
+    total = 0
+    for item in items:
+        text = str(item["text"]).strip()
+        if len(text) > 1800:
+            text = text[:1800].rsplit(" ", 1)[0].strip() + "..."
+        entry = (
+            f"ID: {item['id']}\n"
+            f"Дата: {item['date'].astimezone(MSK).strftime('%Y-%m-%d %H:%M')}\n"
+            f"Ссылка: {item['url']}\n"
+            f"Заголовок: {item['title']}\n"
+            f"Текст: {text}"
+        )
+        if total + len(entry) > max_chars:
+            break
+        parts.append(entry)
+        total += len(entry)
+    return "\n---\n".join(parts)
+
+
+async def summarize_vc_digest(day: str, items: list[dict[str, Any]]) -> str | None:
+    if not ai or not items:
+        return None
+    payload = vc_payload(items)
+    if not payload:
+        return None
+    try:
+        display_day = datetime.strptime(day, "%Y-%m-%d").strftime("%d.%m")
+    except ValueError:
+        display_day = day
+
+    prompt = f"""
+Сделай отдельный дайджест по материалам vc.ru для селлера маркетплейсов.
+
+Главный фокус — Ozon. Wildberries можно добавить немного, только если новость реально важная.
+Не включай пользовательские жалобы, бытовые кейсы покупателей, инвестиционные заметки, рекламу услуг,
+общие рассуждения без фактов и материалы не для селлеров.
+
+Если среди материалов нет важных новостей для селлера Ozon/WB, верни ровно: NO_IMPORTANT
+
+Формат:
+
+📋 VC.ru: важное про Ozon/WB за {display_day}
+
+🖇Короткий заголовок (https://vc.ru/...)
+
+-Что произошло.
+
+-Почему это важно селлеру или что проверить.
+
+Правила:
+- Ozon должен занимать примерно 70-80% дайджеста, если есть подходящие материалы.
+- WB добавляй только после Ozon и только важное.
+- Максимум 6-8 блоков.
+- Не используй markdown и HTML.
+- Не придумывай факты.
+
+Материалы:
+{payload}
+""".strip()
+
+    try:
+        resp = await ai.chat.completions.create(
+            model=CFG["ai"]["model"],
+            messages=[
+                {"role": "system", "content": "Ты редактор отдельной сводки по vc.ru для селлеров Ozon/WB."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=int(CFG.get("vc_digest", {}).get("max_tokens", 1600)),
+            temperature=0.2,
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        if text.upper().startswith("NO_IMPORTANT"):
+            return None
+        return text
+    except Exception as e:
+        log.warning("OpenAI vc digest fail: %s", e)
+        return None
+
+
+async def run_vc_digest_once(
+    out_bot: Bot,
+    client: TelegramClient,
+    conn,
+    *,
+    force: bool = False,
+    send_target: bool = True,
+    send_admins_copy: bool = True,
+) -> str:
+    cfg = CFG.get("vc_digest", {})
+    if not cfg.get("enabled", True) and not force:
+        return "⏸ VC.ru digest выключен в config.yaml."
+
+    now = datetime.now(MSK)
+    day = now.date().isoformat()
+    send_hour = int(cfg.get("send_hour_msk", 9))
+    send_minute = int(cfg.get("send_minute_msk", 20))
+    setting_key = f"{day}:{send_hour}:{send_minute}"
+    if not force and st.setting_get(conn, "last_vc_digest") == setting_key:
+        return f"ℹ️ VC.ru-сводка за {day} уже была обработана."
+
+    items = await fetch_vc_candidates(
+        max_age_hours=float(cfg.get("max_age_hours", 72)),
+        max_items=int(cfg.get("max_items", 30)),
+    )
+    if not items:
+        if not force:
+            st.setting_set(conn, "last_vc_digest", setting_key)
+            st.setting_set(conn, "last_vc_digest_result", "no keyword candidates")
+        return "ℹ️ VC.ru: за период не нашёл материалов про Ozon/WB."
+
+    summary = await summarize_vc_digest(day, items)
+    if not summary:
+        if not force:
+            st.setting_set(conn, "last_vc_digest", setting_key)
+            st.setting_set(conn, "last_vc_digest_result", f"no important items, candidates={len(items)}")
+        return f"ℹ️ VC.ru: кандидатов {len(items)}, но важных новостей для дайджеста AI не выбрал."
+
+    category = str(cfg.get("category", "mp_news"))
+    sent = True
+    chunks = 0
+    total_chunks = 0
+    if send_target:
+        sent, chunks, total_chunks = await send_text_to_target(out_bot, client, conn, category, summary)
+    admin_copies = await send_to_admins(out_bot, conn, summary) if send_admins_copy else 0
+
+    if sent:
+        if not force:
+            st.setting_set(conn, "last_vc_digest", setting_key)
+        st.setting_set(conn, "last_vc_digest_at", now.isoformat(timespec="seconds"))
+        st.setting_set(conn, "last_vc_digest_result", f"sent, candidates={len(items)}, chunks={chunks}/{total_chunks}")
+        return f"✅ VC.ru-сводка отправлена: кандидатов {len(items)}, частей {chunks}/{total_chunks}, копий админам {admin_copies}"
+
+    st.setting_set(conn, "last_vc_digest_result", f"target send failed, candidates={len(items)}, chunks={chunks}/{total_chunks}")
+    return f"❌ VC.ru-сводка не отправилась в целевой чат: частей {chunks}/{total_chunks}, очередь сайта не очищается не нужна."
+
+
 def _daily_pending_count(conn, day: str) -> int:
     return sum(st.queue_size(conn, daily_bucket(day, cat)) for cat in ("mp_news", "marketing"))
 
@@ -775,7 +1015,12 @@ async def run_daily_digest_once(
 
 
 async def daily_digest_worker(out_bot: Bot, client: TelegramClient, conn) -> None:
-    """Send yesterday's AI digest once a day after configured Moscow hour."""
+    """Send yesterday's AI digest once a day after configured Moscow hour.
+
+    The worker deliberately keeps trying after the morning hour. This prevents
+    missed digests when the container restarts, Telegram/OpenAI hiccups, or
+    catch-up fills the queue a few minutes after 09:00.
+    """
     while True:
         await asyncio.sleep(60)
         try:
@@ -785,14 +1030,11 @@ async def daily_digest_worker(out_bot: Bot, client: TelegramClient, conn) -> Non
 
             now = datetime.now(MSK)
             send_hour = int(daily_cfg.get("send_hour_msk", 9))
-            send_window_minutes = int(daily_cfg.get("send_window_minutes", 10))
-            if now.hour != send_hour or now.minute >= send_window_minutes:
+            if now.hour < send_hour:
                 continue
 
             day = (now.date() - timedelta(days=1)).isoformat()
             setting_key = f"{day}:{send_hour}"
-            if st.setting_get(conn, "last_daily_digest") == setting_key:
-                continue
 
             day_stats = st.stats_for_day(conn, day)
             any_pending = False
@@ -846,10 +1088,33 @@ async def daily_digest_worker(out_bot: Bot, client: TelegramClient, conn) -> Non
                         )
                         st.setting_set(conn, fail_key, setting_key)
 
-            if not any_pending or all_sent:
+            if any_pending and all_sent:
                 st.setting_set(conn, "last_daily_digest", setting_key)
         except Exception as e:
             log.exception("daily_digest fail: %s", e)
+
+
+async def vc_digest_worker(out_bot: Bot, client: TelegramClient, conn) -> None:
+    """Send a separate vc.ru digest to the MP target after the Telegram digest."""
+    while True:
+        await asyncio.sleep(300)
+        try:
+            cfg = CFG.get("vc_digest", {})
+            if not cfg.get("enabled", True):
+                continue
+            now = datetime.now(MSK)
+            send_hour = int(cfg.get("send_hour_msk", 9))
+            send_minute = int(cfg.get("send_minute_msk", 20))
+            if (now.hour, now.minute) < (send_hour, send_minute):
+                continue
+            day = now.date().isoformat()
+            setting_key = f"{day}:{send_hour}:{send_minute}"
+            if st.setting_get(conn, "last_vc_digest") == setting_key:
+                continue
+            result = await run_vc_digest_once(out_bot, client, conn, force=False)
+            log.info("vc_digest: %s", result)
+        except Exception as e:
+            log.exception("vc_digest fail: %s", e)
 
 
 async def hourly_digest_worker(out_bot: Bot, client: TelegramClient, conn) -> None:
@@ -1099,6 +1364,18 @@ async def main() -> None:
             category=category,
         )
 
+    async def _run_vc_job(raw_args: str | None = None) -> str:
+        raw = (raw_args or "").strip().lower()
+        send_target = raw in ("send", "отправить")
+        return await run_vc_digest_once(
+            out_bot,
+            client,
+            conn,
+            force=True,
+            send_target=send_target,
+            send_admins_copy=True,
+        )
+
     async def _health_check() -> str:
         today = datetime.now(MSK).date().isoformat()
         yesterday = (datetime.now(MSK).date() - timedelta(days=1)).isoformat()
@@ -1121,6 +1398,8 @@ async def main() -> None:
             f"Очередь вчера маркетинг: {st.queue_size(conn, daily_bucket(yesterday, 'marketing'))}",
             f"Last catchup: {html.escape(st.setting_get(conn, 'last_catchup_at', 'never') or 'never')}",
             f"Catchup result: {html.escape(st.setting_get(conn, 'last_catchup_result', '-') or '-')}",
+            f"Last VC digest: {html.escape(st.setting_get(conn, 'last_vc_digest_at', 'never') or 'never')}",
+            f"VC result: {html.escape(st.setting_get(conn, 'last_vc_digest_result', '-') or '-')}",
             f"Last backup: {html.escape(st.setting_get(conn, 'last_backup_at', 'never') or 'never')}",
         ])
 
@@ -1148,11 +1427,13 @@ async def main() -> None:
     tasks = [
         asyncio.create_task(catchup_worker(out_bot, client, conn), name="catchup-scan"),
         asyncio.create_task(daily_digest_worker(out_bot, client, conn), name="daily-digest"),
+        asyncio.create_task(vc_digest_worker(out_bot, client, conn), name="vc-digest"),
         asyncio.create_task(backup_worker(conn), name="db-backup"),
         asyncio.create_task(admin_bot.run_admin_bot(
             out_bot,
             conn,
             run_job=_runjob,
+            run_vc_job=_run_vc_job,
             health_check=_health_check,
             check_channels=_check_channels,
         ), name="admin-bot"),

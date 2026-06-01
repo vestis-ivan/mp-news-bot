@@ -18,11 +18,23 @@ ai:
 daily_digest:
   enabled: true
   send_hour_msk: 9
-  send_window_minutes: 10
   ai_max_chars: 16000
   max_tokens: 3500
   max_source_links: 25
   send_without_ai: false
+
+vc_digest:
+  enabled: true
+  category: mp_news
+  send_hour_msk: 9
+  send_minute_msk: 20
+  max_age_hours: 72
+  max_items: 30
+  max_tokens: 1600
+  pages:
+    - "https://vc.ru/marketplace"
+    - "https://vc.ru/new"
+    - "https://vc.ru/popular"
 
 catchup:
   enabled: true

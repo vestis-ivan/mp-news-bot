@@ -129,7 +129,7 @@ docker compose run --rm bot python test_ai_from_posts.py maxprowb --limit 10 --a
 
 ## 6. Daily digest mode
 
-The bot now collects posts during the day by Moscow date and sends the previous day's digest during the configured morning window: `daily_digest.send_hour_msk` plus `daily_digest.send_window_minutes` in `config.yaml` (default: 09:00-09:10 MSK).
+The bot now collects posts during the day by Moscow date and sends the previous day's digest after `daily_digest.send_hour_msk` in `config.yaml` (default: after 09:00 MSK). If the container restarts or catch-up fills the queue after 09:00, the worker keeps trying instead of missing the day.
 Before a post enters the daily queue, the bot filters obvious ads by regex and then asks OpenAI to classify hidden/self-promo ads. Filtered ads are counted in `/stats` and in the digest's "Не вошло" section.
 The daily digest is selective: OpenAI ranks posts by importance, includes only high-priority items, and moves weak opinions, repeats, minor cases, and noise into "Не вошло". It also adds action points, hypotheses to test, and practical observations when they follow from the posts.
 If OpenAI fails and `daily_digest.send_without_ai` is `false`, the queue is kept and the scheduled digest is not sent as a noisy fallback archive.
@@ -150,6 +150,8 @@ Admin commands:
 /runjob send marketing 2026-05-25 # send marketing for a date
 /hereremove marketing      # remove marketing target
 /hereremove all            # remove all targets
+/runvc                     # preview separate vc.ru digest
+/runvc send                # send vc.ru digest to MP target
 /queue today all           # show daily queue
 /queue today all quarantine # show filtered ads/noise
 /sources 7                 # source quality for 7 days
@@ -173,6 +175,7 @@ channel_three
 Every digest is sent to the configured `/here` target and copied to all approved admins.
 If a digest is longer than Telegram's message limit, all parts are sent to the target chat/topic.
 If `/here marketing` is set in the same chat/topic where `/here mp_news` used to point, the old MP target is removed automatically to avoid mixing categories.
+The separate vc.ru digest runs after the main Telegram digest, defaults to 09:20 MSK, prioritizes Ozon, and sends to the same `mp_news` target as a separate message.
 
 ## 7. Update after replacing files
 
