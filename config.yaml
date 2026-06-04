@@ -64,6 +64,34 @@ marketing_web_digest:
     - name: "Marketing Dive"
       url: "https://www.marketingdive.com/feeds/news/"
 
+urgent_alerts:
+  enabled: true
+  admins_only: true
+  min_text_length: 120
+  keywords:
+    - "штраф"
+    - "блокиров"
+    - "комисси"
+    - "тариф"
+    - "фас"
+    - "маркиров"
+    - "честный знак"
+    - "возврат"
+    - "поставка"
+    - "склад"
+    - "кабинет"
+    - "api"
+    - "интеграц"
+    - "реклама"
+    - "ставк"
+    - "дедлайн"
+    - "срок"
+    - "с 1 "
+    - "с 01"
+    - "ozon"
+    - "wildberries"
+    - "wb"
+
 catchup:
   enabled: true
   interval_seconds: 300

@@ -259,6 +259,11 @@ def list_admins(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return list(conn.execute("SELECT user_id, username, first_name FROM admins ORDER BY granted_at"))
 
 
+def remove_admin(conn: sqlite3.Connection, user_id: int) -> bool:
+    cur = conn.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
+    return cur.rowcount > 0
+
+
 # ---------- digest queue ------------------------------------------------------
 
 def enqueue_digest(

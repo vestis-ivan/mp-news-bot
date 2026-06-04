@@ -132,6 +132,12 @@ def user_tg_text(user: Any) -> str:
     )
 
 
+def admin_row_text(row: Any) -> str:
+    username = f"@{html.escape(row['username'])}" if row["username"] else "no username"
+    first_name = html.escape(row["first_name"] or "")
+    return f"— {username} · {first_name} · <code>{row['user_id']}</code>"
+
+
 async def send_admin_approval_request(bot: Bot, conn, msg: Message) -> None:
     user = msg.from_user
     if not user:
@@ -326,6 +332,7 @@ def build_router(
     run_job: Callable[[str | None], Awaitable[str]] | None = None,
     run_vc_job: Callable[[str | None], Awaitable[str]] | None = None,
     run_marketing_web_job: Callable[[str | None], Awaitable[str]] | None = None,
+    run_hooks_job: Callable[[str | None], Awaitable[str]] | None = None,
     health_check: Callable[[], Awaitable[str]] | None = None,
     check_channels: Callable[[], Awaitable[str]] | None = None,
 ) -> Router:
@@ -386,6 +393,58 @@ def build_router(
             "• /stats — статистика за сегодня",
             reply_markup=main_menu_kb(),
         )
+
+    @r.message(Command("admins"))
+    async def cmd_admins(msg: Message):
+        if not await check(msg):
+            return
+        admins = st.list_admins(conn)
+        if not admins:
+            await msg.answer("Админов в базе нет.")
+            return
+        lines = ["👥 <b>Админы</b>"]
+        lines.extend(admin_row_text(row) for row in admins)
+        lines.append("\nУдалить: <code>/deladmin @username</code> или <code>/deladmin 123456</code>")
+        await msg.answer("\n".join(lines))
+
+    @r.message(Command("deladmin", "removeadmin"))
+    async def cmd_deladmin(msg: Message, command: CommandObject):
+        if not await check(msg):
+            return
+        raw = (command.args or "").strip()
+        if not raw:
+            await msg.answer("Использование: <code>/deladmin @username</code> или <code>/deladmin 123456</code>")
+            return
+
+        admins = st.list_admins(conn)
+        if len(admins) <= 1:
+            await msg.answer("❌ Нельзя удалить последнего админа.")
+            return
+
+        target = None
+        if raw.isdigit():
+            wanted_id = int(raw)
+            target = next((row for row in admins if int(row["user_id"]) == wanted_id), None)
+        else:
+            wanted_username = raw.strip().lstrip("@").lower()
+            target = next(
+                (
+                    row for row in admins
+                    if (row["username"] or "").strip().lstrip("@").lower() == wanted_username
+                ),
+                None,
+            )
+
+        if not target:
+            await msg.answer("❌ Такого админа не нашёл. Проверь /admins.")
+            return
+
+        if msg.from_user and int(target["user_id"]) == msg.from_user.id:
+            await msg.answer("❌ Себя через /deladmin не удаляю, чтобы ты случайно не закрыл себе доступ.")
+            return
+
+        st.remove_admin(conn, int(target["user_id"]))
+        await msg.answer(f"✅ Удалил админа:\n{admin_row_text(target)}")
 
     @r.message(Command("menu"))
     async def cmd_menu(msg: Message, state: FSMContext):
@@ -681,6 +740,26 @@ def build_router(
         else:
             await notice.edit_text(result)
 
+    @r.message(Command("digest_preview", "preview"))
+    async def cmd_digest_preview(msg: Message, command: CommandObject):
+        if not await check(msg):
+            return
+        if run_job is None:
+            await msg.answer("❌ Preview не подключен в этом процессе.")
+            return
+        raw_args = (command.args or "").strip()
+        tokens = [t for t in raw_args.split() if t.lower() not in ("send", "отправить")]
+        notice = await msg.answer("⏳ Собираю preview дайджеста для админов без отправки в канал...")
+        try:
+            result = await run_job(" ".join(tokens) or None)
+        except ValueError as e:
+            await notice.edit_text(f"❌ {e}")
+        except Exception as e:
+            log.exception("digest_preview fail: %s", e)
+            await notice.edit_text(f"❌ Не получилось собрать preview: {e}")
+        else:
+            await notice.edit_text(result)
+
     @r.message(Command("runvc"))
     async def cmd_runvc(msg: Message, command: CommandObject):
         if not await check(msg):
@@ -722,6 +801,23 @@ def build_router(
         except Exception as e:
             log.exception("runmweb fail: %s", e)
             await notice.edit_text(f"❌ Не получилось запустить beauty web-сводку: {e}")
+        else:
+            await notice.edit_text(result)
+
+    @r.message(Command("hooks"))
+    async def cmd_hooks(msg: Message, command: CommandObject):
+        if not await check(msg):
+            return
+        if run_hooks_job is None:
+            await msg.answer("❌ Генератор хуков не подключен в этом процессе.")
+            return
+        topic = (command.args or "").strip() or None
+        notice = await msg.answer("⏳ Придумываю beauty-хуки для TikTok/Reels...")
+        try:
+            result = await run_hooks_job(topic)
+        except Exception as e:
+            log.exception("hooks fail: %s", e)
+            await notice.edit_text(f"❌ Не получилось придумать хуки: {e}")
         else:
             await notice.edit_text(result)
 
@@ -1120,8 +1216,11 @@ def build_router(
             "<code>/pause @username</code>\n"
             "<code>/resume @username</code>\n"
             "<code>/list mp_news|marketing</code>\n"
+            "<code>/admins</code> — список админов\n"
+            "<code>/deladmin @username|id</code> — удалить админа\n"
             "<code>/stats</code> — статистика за день\n"
             "<code>/runjob</code> — preview дайджеста админам, очередь не очищается\n"
+            "<code>/digest_preview marketing</code> — понятный alias preview\n"
             "<code>/runjob marketing</code> — preview только маркетинга\n"
             "<code>/runjob yesterday marketing</code> — preview за дату/день\n"
             "<code>/runjob send</code> — отправить дайджест в целевой чат, очередь не очищается\n"
@@ -1131,6 +1230,7 @@ def build_router(
             "<code>/runvc send</code> — отправить VC.ru-сводку в MP-чат\n"
             "<code>/runmweb</code> — preview beauty web-сводки по TikTok/Instagram\n"
             "<code>/runmweb send</code> — отправить beauty web-сводку в marketing-чат\n"
+            "<code>/hooks крем от отеков</code> — 15 хуков для TikTok/Reels\n"
             "<code>/queue today all</code> — посмотреть накопленные посты\n"
             "<code>/queue today all quarantine</code> — посмотреть отсеянное\n"
             "<code>/clearqueue today all</code> — очистить очередь вручную\n"
@@ -1251,6 +1351,7 @@ async def run_admin_bot(
     run_job: Callable[[str | None], Awaitable[str]] | None = None,
     run_vc_job: Callable[[str | None], Awaitable[str]] | None = None,
     run_marketing_web_job: Callable[[str | None], Awaitable[str]] | None = None,
+    run_hooks_job: Callable[[str | None], Awaitable[str]] | None = None,
     health_check: Callable[[], Awaitable[str]] | None = None,
     check_channels: Callable[[], Awaitable[str]] | None = None,
 ) -> None:
@@ -1263,6 +1364,7 @@ async def run_admin_bot(
             run_job=run_job,
             run_vc_job=run_vc_job,
             run_marketing_web_job=run_marketing_web_job,
+            run_hooks_job=run_hooks_job,
             health_check=health_check,
             check_channels=check_channels,
         )

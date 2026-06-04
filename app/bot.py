@@ -223,6 +223,49 @@ async def check_openai_status() -> tuple[bool, str]:
         return False, str(e)
 
 
+async def generate_beauty_hooks(topic: str | None = None) -> str:
+    topic = (topic or "beauty/cosmetics: уход, макияж, волосы, кожа").strip()
+    if not ai:
+        return "❌ OpenAI не подключен, хуки не сгенерировать."
+
+    prompt = f"""
+Придумай 15 сильных хуков для TikTok/Reels на русском.
+
+Ниша/продукт: {topic}
+
+Формат:
+🎬 Хуки для: {topic}
+
+1. «...»
+Почему цепляет: ...
+Как снять: ...
+
+Правила:
+- Хук должен звучать как первая фраза ролика.
+- Пиши под beauty/cosmetics/ecom, даже если тема широкая.
+- Делай конкретно: кожа, поры, отеки, сухость, SPF, макияж, стойкость, волосы, аромат, текстура, до/после.
+- Стиль: TikTok/Reels, чуть дерзко, но без обмана и медицинских обещаний.
+- Не используй слова "гарантированно", "лечит", "навсегда".
+- Не пиши общие фразы вроде "попробуйте наш продукт".
+""".strip()
+
+    try:
+        resp = await ai.chat.completions.create(
+            model=CFG["ai"]["model"],
+            messages=[
+                {"role": "system", "content": "Ты креативный стратег TikTok/Reels для beauty brands. Пиши на русском."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=1800,
+            temperature=0.75,
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        return html.escape(text) if text else "❌ OpenAI вернул пустой ответ."
+    except Exception as e:
+        log.warning("OpenAI hooks fail: %s", e)
+        return f"❌ Не получилось сгенерировать хуки: {e}"
+
+
 # ---------- Форматирование ----------------------------------------------------
 
 def format_msg(*, source: str, title: str, msg_id: int, body: str, summary: str | None) -> str:
@@ -358,6 +401,78 @@ def daily_digest_fail_notice_key(day: str, category: str, send_hour: int) -> str
     return f"daily_digest_fail_notice:{day}:{category}:{send_hour}"
 
 
+def urgent_alert_score(text: str, category: str) -> int:
+    cfg = CFG.get("urgent_alerts", {})
+    if not cfg.get("enabled", False):
+        return 0
+    min_len = int(cfg.get("min_text_length", 120))
+    if len(text) < min_len:
+        return 0
+
+    low = text.lower()
+    marketplace = any(word in low for word in (
+        "ozon", "озон", "wildberries", "вайлдберриз", "wb ", " wb", "вб ", " вб",
+        "маркетплейс", "селлер",
+    ))
+    severe_words = (
+        "штраф", "блокиров", "комисси", "тариф", "фас", "маркиров", "честный знак",
+        "дедлайн", "срок", "кабинет", "api", "интеграц", "возврат", "поставка",
+        "склад", "акция", "ставк", "аукцион", "реклама",
+    )
+    cfg_words = tuple(
+        str(word).strip().lower()
+        for word in cfg.get("keywords", [])
+        if str(word).strip()
+    )
+    severe = sum(1 for word in set(severe_words + cfg_words) if word in low)
+    date_signal = bool(re.search(r"\bс\s+\d{1,2}\s+(?:январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентябр|октябр|ноябр|декабр)", low))
+    money_signal = bool(re.search(r"\d+\s*(?:%|₽|руб|р\.)", low))
+
+    score = severe
+    if marketplace:
+        score += 1
+    if date_signal:
+        score += 1
+    if money_signal:
+        score += 1
+    if category == "marketing" and any(word in low for word in ("реклама", "ставк", "аукцион", "ctr", "cvr", "продвиж")):
+        score += 1
+    return score if marketplace and score >= 3 else 0
+
+
+async def maybe_send_urgent_alert(
+    out_bot: Bot,
+    conn,
+    *,
+    username: str,
+    msg_id: int,
+    category: str,
+    text: str,
+) -> None:
+    score = urgent_alert_score(text, category)
+    if not score:
+        return
+    key = f"urgent_alert:{username}:{msg_id}"
+    if st.setting_get(conn, key):
+        return
+    link = f"https://t.me/{username}/{msg_id}"
+    snippet = text.replace("\n", " ").strip()
+    if len(snippet) > 900:
+        snippet = snippet[:900].rsplit(" ", 1)[0].strip() + "..."
+    label = DAILY_CATEGORY_LABEL.get(category, category)
+    await send_to_admins(
+        out_bot,
+        conn,
+        (
+            f"🚨 <b>Срочный сигнал</b> · {html.escape(label)}\n\n"
+            f"Источник: <a href=\"{link}\">@{html.escape(username)}</a>\n"
+            f"Причина: похоже на важное изменение/дедлайн/деньги для селлера.\n\n"
+            f"{html.escape(snippet)}"
+        ),
+    )
+    st.setting_set(conn, key, datetime.now(MSK).isoformat(timespec="seconds"))
+
+
 async def handle_message(out_bot: Bot, client: TelegramClient, conn, event: events.NewMessage.Event) -> None:
     msg: Message = event.message
     chat = await event.get_chat()
@@ -410,6 +525,15 @@ async def handle_message_from_chat(out_bot: Bot, client: TelegramClient, conn, m
         st.bump_source_stat(conn, day, username, ch.category, "blocked_noise")
         st.enqueue_digest(conn, quarantine_bucket(day, ch.category), username, msg.chat_id, msg.id, "[NOISE]\n" + cleaned)
         return
+
+    await maybe_send_urgent_alert(
+        out_bot,
+        conn,
+        username=username,
+        msg_id=msg.id,
+        category=ch.category,
+        text=cleaned,
+    )
 
     bucket = daily_bucket(day, ch.category)
     st.enqueue_digest(conn, bucket, username, msg.chat_id, msg.id, cleaned)
@@ -541,10 +665,12 @@ async def summarize_daily(category: str, day: str, rows: list[Any], filtered_ads
 
 Правила оформления:
 - Без markdown, без жирного текста, без HTML.
-- Один важный инфоповод = один блок.
+- Один важный инфоповод = один блок. Если 2-5 постов говорят об одном событии, объедини их в один блок и оставь самую сильную ссылку.
 - Заголовок начинай с 🖇, а особо денежные/практичные штуки можно начать с 👍.
 - Ссылку ставь прямо в заголовок в скобках. Если ссылки нет в посте, используй ссылку Telegram-источника вида https://t.me/channel/123.
-- Под каждым заголовком дай 1-4 подпункта через дефис, как в примере.
+- Под каждым заголовком дай 2-4 подпункта через дефис, как в примере.
+- Почти в каждом блоке должен быть прикладной пункт "Что сделать:" или "Что проверить:", если из новости следует действие.
+- Если из новости можно вывести полезную идею для теста, добавь подпункт "Гипотеза:".
 - Не пиши разделы "Главное", "Важно знать", "Гипотезы", "Не вошло".
 - Не добавляй в дайджест рекламу, самопиар, опросы, анонсы вебинаров, мнения без фактов и мелкие истории без вывода.
 - Не придумывай факты, цифры, сроки, причины и выводы. Если детали нет в постах — не добавляй ее.
@@ -1900,6 +2026,9 @@ async def main() -> None:
             send_admins_copy=True,
         )
 
+    async def _run_hooks_job(raw_args: str | None = None) -> str:
+        return await generate_beauty_hooks(raw_args)
+
     async def _health_check() -> str:
         today = datetime.now(MSK).date().isoformat()
         yesterday = (datetime.now(MSK).date() - timedelta(days=1)).isoformat()
@@ -1962,6 +2091,7 @@ async def main() -> None:
             run_job=_runjob,
             run_vc_job=_run_vc_job,
             run_marketing_web_job=_run_marketing_web_job,
+            run_hooks_job=_run_hooks_job,
             health_check=_health_check,
             check_channels=_check_channels,
         ), name="admin-bot"),
