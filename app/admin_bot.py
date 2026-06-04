@@ -332,7 +332,7 @@ def build_router(
     run_job: Callable[[str | None], Awaitable[str]] | None = None,
     run_vc_job: Callable[[str | None], Awaitable[str]] | None = None,
     run_marketing_web_job: Callable[[str | None], Awaitable[str]] | None = None,
-    run_hooks_job: Callable[[str | None], Awaitable[str]] | None = None,
+    run_hooks_job: Callable[[str | None, bool], Awaitable[str]] | None = None,
     health_check: Callable[[], Awaitable[str]] | None = None,
     check_channels: Callable[[], Awaitable[str]] | None = None,
 ) -> Router:
@@ -804,7 +804,7 @@ def build_router(
         else:
             await notice.edit_text(result)
 
-    @r.message(Command("hooks"))
+    @r.message(Command("hook", "hooks"))
     async def cmd_hooks(msg: Message, command: CommandObject):
         if not await check(msg):
             return
@@ -812,9 +812,15 @@ def build_router(
             await msg.answer("❌ Генератор хуков не подключен в этом процессе.")
             return
         topic = (command.args or "").strip() or None
-        notice = await msg.answer("⏳ Придумываю beauty-хуки для TikTok/Reels...")
+        cmd_name = (getattr(command, "command", "") or "").lower()
+        send_to_marketing = cmd_name == "hook"
+        notice = await msg.answer(
+            "⏳ Придумываю beauty-хуки и отправляю в marketing-чат..."
+            if send_to_marketing else
+            "⏳ Придумываю beauty-хуки для TikTok/Reels..."
+        )
         try:
-            result = await run_hooks_job(topic)
+            result = await run_hooks_job(topic, send_to_marketing)
         except Exception as e:
             log.exception("hooks fail: %s", e)
             await notice.edit_text(f"❌ Не получилось придумать хуки: {e}")
@@ -1230,7 +1236,8 @@ def build_router(
             "<code>/runvc send</code> — отправить VC.ru-сводку в MP-чат\n"
             "<code>/runmweb</code> — preview beauty web-сводки по TikTok/Instagram\n"
             "<code>/runmweb send</code> — отправить beauty web-сводку в marketing-чат\n"
-            "<code>/hooks крем от отеков</code> — 15 хуков для TikTok/Reels\n"
+            "<code>/hooks крем от отеков</code> — preview 15 хуков для TikTok/Reels\n"
+            "<code>/hook крем-маска для волос</code> — отправить хуки в marketing-чат\n"
             "<code>/queue today all</code> — посмотреть накопленные посты\n"
             "<code>/queue today all quarantine</code> — посмотреть отсеянное\n"
             "<code>/clearqueue today all</code> — очистить очередь вручную\n"
@@ -1351,7 +1358,7 @@ async def run_admin_bot(
     run_job: Callable[[str | None], Awaitable[str]] | None = None,
     run_vc_job: Callable[[str | None], Awaitable[str]] | None = None,
     run_marketing_web_job: Callable[[str | None], Awaitable[str]] | None = None,
-    run_hooks_job: Callable[[str | None], Awaitable[str]] | None = None,
+    run_hooks_job: Callable[[str | None, bool], Awaitable[str]] | None = None,
     health_check: Callable[[], Awaitable[str]] | None = None,
     check_channels: Callable[[], Awaitable[str]] | None = None,
 ) -> None:

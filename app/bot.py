@@ -2026,8 +2026,19 @@ async def main() -> None:
             send_admins_copy=True,
         )
 
-    async def _run_hooks_job(raw_args: str | None = None) -> str:
-        return await generate_beauty_hooks(raw_args)
+    async def _run_hooks_job(raw_args: str | None = None, send_target: bool = False) -> str:
+        hooks = await generate_beauty_hooks(raw_args)
+        if not send_target:
+            return hooks
+        if hooks.startswith("❌"):
+            return hooks
+        if not st.get_target(conn, "marketing"):
+            return "❌ Для marketing не задан чат. Напиши в нужном чате: /here marketing"
+        ok, sent, total = await send_text_to_target(out_bot, client, conn, "marketing", hooks)
+        if not ok:
+            return f"❌ Хуки сгенерированы, но не все части ушли в marketing-чат ({sent}/{total}).\n\n{hooks}"
+        topic = (raw_args or "beauty/cosmetics").strip()
+        return f"✅ Хуки по теме «{html.escape(topic)}» отправлены в marketing-чат ({sent}/{total})."
 
     async def _health_check() -> str:
         today = datetime.now(MSK).date().isoformat()
