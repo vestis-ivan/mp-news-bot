@@ -36,6 +36,34 @@ vc_digest:
     - "https://vc.ru/new"
     - "https://vc.ru/popular"
 
+marketing_web_digest:
+  enabled: true
+  category: marketing
+  send_hour_msk: 9
+  send_minute_msk: 40
+  max_age_hours: 96
+  max_items: 35
+  max_tokens: 2600
+  sources:
+    - name: "Social Media Today"
+      url: "https://www.socialmediatoday.com/feeds/news/"
+    - name: "Hootsuite"
+      url: "https://blog.hootsuite.com/feed/"
+    - name: "Buffer"
+      url: "https://buffer.com/resources/rss/"
+    - name: "Sprout Social"
+      url: "https://sproutsocial.com/insights/feed/"
+    - name: "Social Media Examiner"
+      url: "https://www.socialmediaexaminer.com/feed/"
+    - name: "Glossy"
+      url: "https://www.glossy.co/feed/"
+    - name: "Modern Retail"
+      url: "https://www.modernretail.co/feed/"
+    - name: "Tubefilter"
+      url: "https://www.tubefilter.com/feed/"
+    - name: "Marketing Dive"
+      url: "https://www.marketingdive.com/feeds/news/"
+
 catchup:
   enabled: true
   interval_seconds: 300

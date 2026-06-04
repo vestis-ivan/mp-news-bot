@@ -21,7 +21,9 @@ import re
 import sqlite3
 import signal
 import sys
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -944,6 +946,380 @@ async def run_vc_digest_once(
     return f"❌ VC.ru-сводка не отправилась в целевой чат: частей {chunks}/{total_chunks}, очередь сайта не очищается не нужна."
 
 
+# ---------- Marketing web digest ---------------------------------------------
+
+def parse_feed_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        dt = parsedate_to_datetime(value)
+    except Exception:
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def xml_child_text(node: ET.Element, names: tuple[str, ...]) -> str:
+    for name in names:
+        child = node.find(name)
+        if child is not None and child.text:
+            return child.text.strip()
+    return ""
+
+
+def marketing_web_score(text: str) -> int:
+    low = text.lower()
+    score = 0
+    for word in ("tiktok", "tik tok", "instagram", "reels", "short-form", "short form", "short video"):
+        if word in low:
+            score += 3
+    for word in ("beauty", "skincare", "skin care", "cosmetic", "cosmetics", "makeup", "haircare", "fragrance"):
+        if word in low:
+            score += 3
+    for word in ("creator", "influencer", "ugc", "hook", "viral", "trend", "social commerce", "shop", "shopping"):
+        if word in low:
+            score += 2
+    for word in ("campaign", "ads", "advertising", "content", "engagement", "algorithm", "brand", "retail"):
+        if word in low:
+            score += 1
+    return score
+
+
+def parse_feed_items(xml_text: str, source_name: str, source_url: str) -> list[dict[str, Any]]:
+    try:
+        root = ET.fromstring(xml_text.encode("utf-8"))
+    except ET.ParseError as e:
+        log.warning("marketing web feed parse fail %s: %s", source_url, e)
+        return []
+
+    items: list[dict[str, Any]] = []
+    rss_items = root.findall("./channel/item")
+    atom_items = root.findall("{http://www.w3.org/2005/Atom}entry")
+
+    if rss_items:
+        for item in rss_items:
+            title = strip_html_text(xml_child_text(item, ("title",)))
+            link = xml_child_text(item, ("link", "guid"))
+            published = parse_feed_datetime(xml_child_text(item, ("pubDate", "published", "updated")))
+            description = strip_html_text(xml_child_text(item, (
+                "description",
+                "{http://purl.org/rss/1.0/modules/content/}encoded",
+            )))
+            text = f"{title}\n{description}".strip()
+            if title and link:
+                items.append({
+                    "id": f"{source_name}:{abs(hash(link))}",
+                    "source": source_name,
+                    "url": link,
+                    "title": title,
+                    "text": text,
+                    "date": published,
+                    "score": marketing_web_score(text),
+                })
+
+    if atom_items:
+        for item in atom_items:
+            title = strip_html_text(xml_child_text(item, ("{http://www.w3.org/2005/Atom}title",)))
+            link = ""
+            for child in item.findall("{http://www.w3.org/2005/Atom}link"):
+                href = child.attrib.get("href")
+                if href:
+                    link = href
+                    break
+            published = parse_feed_datetime(xml_child_text(item, (
+                "{http://www.w3.org/2005/Atom}published",
+                "{http://www.w3.org/2005/Atom}updated",
+            )))
+            summary = strip_html_text(xml_child_text(item, (
+                "{http://www.w3.org/2005/Atom}summary",
+                "{http://www.w3.org/2005/Atom}content",
+            )))
+            text = f"{title}\n{summary}".strip()
+            if title and link:
+                items.append({
+                    "id": f"{source_name}:{abs(hash(link))}",
+                    "source": source_name,
+                    "url": link,
+                    "title": title,
+                    "text": text,
+                    "date": published,
+                    "score": marketing_web_score(text),
+                })
+
+    return items
+
+
+async def fetch_marketing_web_candidates(max_age_hours: float, max_items: int) -> list[dict[str, Any]]:
+    cfg = CFG.get("marketing_web_digest", {})
+    sources = cfg.get("sources") or []
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    seen_urls: set[str] = set()
+    out: list[dict[str, Any]] = []
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; MPNewsBot/1.0; marketing digest)",
+        "Accept": "application/rss+xml,application/xml,text/xml,text/html",
+    }
+
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers=headers) as http:
+        for source in sources:
+            if isinstance(source, str):
+                source_name = source
+                source_url = source
+            else:
+                source_name = str(source.get("name") or source.get("url") or "source")
+                source_url = str(source.get("url") or "")
+            if not source_url:
+                continue
+            try:
+                resp = await http.get(source_url)
+                resp.raise_for_status()
+            except Exception as e:
+                log.warning("marketing web fetch fail %s: %s", source_url, e)
+                continue
+
+            for item in parse_feed_items(resp.text, source_name, source_url):
+                url = str(item["url"])
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                published = item.get("date")
+                if isinstance(published, datetime) and published < cutoff:
+                    continue
+                if int(item.get("score") or 0) < 2:
+                    continue
+                out.append(item)
+
+    out.sort(
+        key=lambda x: (
+            int(x.get("score") or 0),
+            x["date"] if isinstance(x.get("date"), datetime) else datetime.min.replace(tzinfo=timezone.utc),
+        ),
+        reverse=True,
+    )
+    return out[:max_items]
+
+
+def marketing_web_payload(items: list[dict[str, Any]], max_chars: int = 18000) -> str:
+    parts: list[str] = []
+    total = 0
+    for idx, item in enumerate(items, start=1):
+        text = str(item["text"]).strip()
+        if len(text) > 1400:
+            text = text[:1400].rsplit(" ", 1)[0].strip() + "..."
+        published = item.get("date")
+        date_s = published.astimezone(MSK).strftime("%Y-%m-%d %H:%M") if isinstance(published, datetime) else "unknown"
+        entry = (
+            f"ID: {idx}\n"
+            f"Источник: {item['source']}\n"
+            f"Дата: {date_s}\n"
+            f"Ссылка: {item['url']}\n"
+            f"Заголовок: {item['title']}\n"
+            f"Текст: {text}"
+        )
+        if total + len(entry) > max_chars:
+            break
+        parts.append(entry)
+        total += len(entry)
+    return "\n---\n".join(parts)
+
+
+def render_marketing_web_digest(day: str, items: list[dict[str, Any]], ai_data: dict[str, Any]) -> str | None:
+    raw_ideas = ai_data.get("ideas")
+    if not isinstance(raw_ideas, list):
+        return None
+
+    try:
+        display_day = datetime.strptime(day, "%Y-%m-%d").strftime("%d.%m")
+    except ValueError:
+        display_day = day
+
+    blocks = [f"💄 TikTok/Instagram beauty-сводка за {display_day}"]
+    added = 0
+    for raw in raw_ideas:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            item_idx = int(raw.get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if item_idx < 1 or item_idx > len(items):
+            continue
+        source = items[item_idx - 1]
+        angle = strip_html_text(str(raw.get("angle") or "")).strip()
+        insight = strip_html_text(str(raw.get("insight") or "")).strip()
+        how = strip_html_text(str(raw.get("how_to_use") or "")).strip()
+        hooks = raw.get("hooks")
+        if not angle or not insight or not how or not isinstance(hooks, list):
+            continue
+        clean_hooks = [strip_html_text(str(h)).strip(" \"«»") for h in hooks if str(h).strip()]
+        clean_hooks = [h for h in clean_hooks if len(h) >= 8][:3]
+        if len(clean_hooks) < 2:
+            continue
+
+        title = html.escape(angle)
+        source_name = html.escape(str(source["source"]))
+        url = html.escape(str(source["url"]), quote=False)
+        block = [
+            f"{added + 1}. <b>{title}</b>",
+            f"Источник: <a href=\"{url}\">{source_name}</a>",
+            f"Суть: {html.escape(insight)}",
+            f"Как применить: {html.escape(how)}",
+            "Хуки:",
+        ]
+        block.extend(f"— «{html.escape(hook)}»" for hook in clean_hooks)
+        blocks.append("\n".join(block))
+        added += 1
+        if added >= 5:
+            break
+
+    watch = ai_data.get("watch")
+    if isinstance(watch, list):
+        clean_watch = [strip_html_text(str(x)).strip(" -\n\t") for x in watch if str(x).strip()]
+        clean_watch = [x for x in clean_watch if len(x) >= 10][:3]
+        if clean_watch:
+            blocks.append("📌 Что потестить сегодня:\n" + "\n".join(f"— {html.escape(x)}" for x in clean_watch))
+
+    if not added:
+        return None
+    return "\n\n".join(blocks)
+
+
+async def summarize_marketing_web_digest(day: str, items: list[dict[str, Any]]) -> str | None:
+    if not ai or not items:
+        return None
+    payload = marketing_web_payload(items)
+    if not payload:
+        return None
+
+    prompt = f"""
+Ты стратег по TikTok/Instagram для beauty/cosmetics brands.
+На входе свежие материалы из зарубежных маркетинговых медиа. Переведи смысл на русский и сделай маленькую практическую сводку.
+
+Нужны не новости ради новостей, а идеи для контента, рекламных креативов, Reels/TikTok и UGC в нише косметики, ухода, макияжа, волос, парфюма.
+Пиши для человека, который продает/продвигает beauty-бренд и хочет сегодня снять/запустить что-то полезное.
+
+Верни строго JSON без markdown:
+{{
+  "ideas": [
+    {{
+      "id": 1,
+      "angle": "Короткое название идеи на русском",
+      "insight": "Суть тренда или наблюдения из источника, без воды.",
+      "how_to_use": "Как применить это в TikTok/Instagram для beauty/cosmetics.",
+      "hooks": [
+        "Готовый хук для ролика",
+        "Еще один готовый хук",
+        "Третий хук"
+      ]
+    }}
+  ],
+  "watch": [
+    "Короткая гипотеза/тест на сегодня"
+  ]
+}}
+
+Правила:
+- Выбери максимум 5 самых применимых идей.
+- Все выводы и хуки пиши на русском.
+- Можно адаптировать англоязычный материал под российский beauty/ecom-контекст, но не придумывай статистику и факты.
+- Хуки должны быть цепляющими, конкретными, в стиле TikTok/Reels. Пример уровня: "ЭТА МАСКА СПАСЛА МОЮ КОЖУ ЗА НОЧЬ".
+- Не включай общие советы вроде "делайте качественный контент". Только то, что можно снять/проверить.
+- Используй только ID материалов из списка.
+- Если применимых идей нет, верни {{"ideas":[],"watch":[]}}.
+
+Материалы:
+{payload}
+""".strip()
+
+    try:
+        resp = await ai.chat.completions.create(
+            model=CFG["ai"]["model"],
+            messages=[
+                {"role": "system", "content": "Ты TikTok/Instagram strategist для beauty/cosmetics. Отвечай только валидным JSON на русском."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=int(CFG.get("marketing_web_digest", {}).get("max_tokens", 2600)),
+            response_format={"type": "json_object"},
+            temperature=0.45,
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        data = _parse_ai_json_object(text)
+        if not data:
+            log.warning("OpenAI marketing web digest returned non-json: %s", text[:300])
+            return None
+        return render_marketing_web_digest(day, items, data)
+    except Exception as e:
+        log.warning("OpenAI marketing web digest fail: %s", e)
+        return None
+
+
+async def run_marketing_web_digest_once(
+    out_bot: Bot,
+    client: TelegramClient,
+    conn,
+    *,
+    force: bool = False,
+    send_target: bool = True,
+    send_admins_copy: bool = True,
+) -> str:
+    cfg = CFG.get("marketing_web_digest", {})
+    if not cfg.get("enabled", True) and not force:
+        return "⏸ Marketing web digest выключен в config.yaml."
+
+    now = datetime.now(MSK)
+    day = now.date().isoformat()
+    send_hour = int(cfg.get("send_hour_msk", 9))
+    send_minute = int(cfg.get("send_minute_msk", 40))
+    category = str(cfg.get("category", "marketing"))
+    if send_target and not st.get_target(conn, category):
+        return f"❌ Beauty web-сводку не отправляю: нет целевого чата/темы для {category}. Задай /here {category}."
+
+    setting_key = f"{day}:{send_hour}:{send_minute}"
+    if not force and st.setting_get(conn, "last_marketing_web_digest") == setting_key:
+        return f"ℹ️ Beauty web-сводка за {day} уже была обработана."
+
+    items = await fetch_marketing_web_candidates(
+        max_age_hours=float(cfg.get("max_age_hours", 96)),
+        max_items=int(cfg.get("max_items", 35)),
+    )
+    if not items:
+        if not force:
+            st.setting_set(conn, "last_marketing_web_digest", setting_key)
+            st.setting_set(conn, "last_marketing_web_digest_result", "no keyword candidates")
+        return "ℹ️ Beauty web: за период не нашёл материалов по TikTok/Instagram/beauty."
+
+    summary = await summarize_marketing_web_digest(day, items)
+    if not summary:
+        if not force:
+            st.setting_set(conn, "last_marketing_web_digest", setting_key)
+            st.setting_set(conn, "last_marketing_web_digest_result", f"no useful ideas, candidates={len(items)}")
+        return f"ℹ️ Beauty web: кандидатов {len(items)}, но AI не выбрал полезные идеи."
+
+    sent = True
+    chunks = 0
+    total_chunks = 0
+    if send_target:
+        sent, chunks, total_chunks = await send_text_to_target(out_bot, client, conn, category, summary)
+    admin_copies = await send_to_admins(out_bot, conn, summary) if send_admins_copy else 0
+
+    if sent:
+        if not force:
+            st.setting_set(conn, "last_marketing_web_digest", setting_key)
+        st.setting_set(conn, "last_marketing_web_digest_at", now.isoformat(timespec="seconds"))
+        st.setting_set(conn, "last_marketing_web_digest_result", f"sent, candidates={len(items)}, chunks={chunks}/{total_chunks}")
+        return f"✅ Beauty web-сводка отправлена: кандидатов {len(items)}, частей {chunks}/{total_chunks}, копий админам {admin_copies}"
+
+    st.setting_set(conn, "last_marketing_web_digest_result", f"target send failed, candidates={len(items)}, chunks={chunks}/{total_chunks}")
+    return f"❌ Beauty web-сводка не отправилась в marketing-чат: частей {chunks}/{total_chunks}."
+
+
 def _daily_pending_count(conn, day: str) -> int:
     return sum(st.queue_size(conn, daily_bucket(day, cat)) for cat in ("mp_news", "marketing"))
 
@@ -1227,6 +1603,29 @@ async def vc_digest_worker(out_bot: Bot, client: TelegramClient, conn) -> None:
             log.exception("vc_digest fail: %s", e)
 
 
+async def marketing_web_digest_worker(out_bot: Bot, client: TelegramClient, conn) -> None:
+    """Send a separate web digest with TikTok/Instagram beauty ideas to marketing."""
+    while True:
+        await asyncio.sleep(300)
+        try:
+            cfg = CFG.get("marketing_web_digest", {})
+            if not cfg.get("enabled", True):
+                continue
+            now = datetime.now(MSK)
+            send_hour = int(cfg.get("send_hour_msk", 9))
+            send_minute = int(cfg.get("send_minute_msk", 40))
+            if (now.hour, now.minute) < (send_hour, send_minute):
+                continue
+            day = now.date().isoformat()
+            setting_key = f"{day}:{send_hour}:{send_minute}"
+            if st.setting_get(conn, "last_marketing_web_digest") == setting_key:
+                continue
+            result = await run_marketing_web_digest_once(out_bot, client, conn, force=False)
+            log.info("marketing_web_digest: %s", result)
+        except Exception as e:
+            log.exception("marketing_web_digest fail: %s", e)
+
+
 async def hourly_digest_worker(out_bot: Bot, client: TelegramClient, conn) -> None:
     """ozon_novosti — раз в час 09-21 МСК."""
     last_hour: int | None = None
@@ -1486,6 +1885,18 @@ async def main() -> None:
             send_admins_copy=True,
         )
 
+    async def _run_marketing_web_job(raw_args: str | None = None) -> str:
+        raw = (raw_args or "").strip().lower()
+        send_target = raw in ("send", "отправить")
+        return await run_marketing_web_digest_once(
+            out_bot,
+            client,
+            conn,
+            force=True,
+            send_target=send_target,
+            send_admins_copy=True,
+        )
+
     async def _health_check() -> str:
         today = datetime.now(MSK).date().isoformat()
         yesterday = (datetime.now(MSK).date() - timedelta(days=1)).isoformat()
@@ -1510,6 +1921,8 @@ async def main() -> None:
             f"Catchup result: {html.escape(st.setting_get(conn, 'last_catchup_result', '-') or '-')}",
             f"Last VC digest: {html.escape(st.setting_get(conn, 'last_vc_digest_at', 'never') or 'never')}",
             f"VC result: {html.escape(st.setting_get(conn, 'last_vc_digest_result', '-') or '-')}",
+            f"Last beauty web: {html.escape(st.setting_get(conn, 'last_marketing_web_digest_at', 'never') or 'never')}",
+            f"Beauty web result: {html.escape(st.setting_get(conn, 'last_marketing_web_digest_result', '-') or '-')}",
             f"Last backup: {html.escape(st.setting_get(conn, 'last_backup_at', 'never') or 'never')}",
         ])
 
@@ -1538,12 +1951,14 @@ async def main() -> None:
         asyncio.create_task(catchup_worker(out_bot, client, conn), name="catchup-scan"),
         asyncio.create_task(daily_digest_worker(out_bot, client, conn), name="daily-digest"),
         asyncio.create_task(vc_digest_worker(out_bot, client, conn), name="vc-digest"),
+        asyncio.create_task(marketing_web_digest_worker(out_bot, client, conn), name="marketing-web-digest"),
         asyncio.create_task(backup_worker(conn), name="db-backup"),
         asyncio.create_task(admin_bot.run_admin_bot(
             out_bot,
             conn,
             run_job=_runjob,
             run_vc_job=_run_vc_job,
+            run_marketing_web_job=_run_marketing_web_job,
             health_check=_health_check,
             check_channels=_check_channels,
         ), name="admin-bot"),

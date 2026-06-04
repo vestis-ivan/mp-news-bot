@@ -325,6 +325,7 @@ def build_router(
     bot: Bot,
     run_job: Callable[[str | None], Awaitable[str]] | None = None,
     run_vc_job: Callable[[str | None], Awaitable[str]] | None = None,
+    run_marketing_web_job: Callable[[str | None], Awaitable[str]] | None = None,
     health_check: Callable[[], Awaitable[str]] | None = None,
     check_channels: Callable[[], Awaitable[str]] | None = None,
 ) -> Router:
@@ -699,6 +700,28 @@ def build_router(
         except Exception as e:
             log.exception("runvc fail: %s", e)
             await notice.edit_text(f"❌ Не получилось запустить VC.ru-сводку: {e}")
+        else:
+            await notice.edit_text(result)
+
+    @r.message(Command("runmweb", "runbeauty"))
+    async def cmd_runmweb(msg: Message, command: CommandObject):
+        if not await check(msg):
+            return
+        if run_marketing_web_job is None:
+            await msg.answer("❌ Beauty web-сводка не подключена в этом процессе.")
+            return
+        raw_args = (command.args or "").strip() or None
+        is_send = bool(raw_args and raw_args.split()[0].lower() in ("send", "отправить"))
+        notice = await msg.answer(
+            "⏳ Собираю и отправляю beauty web-сводку в marketing-чат..."
+            if is_send else
+            "⏳ Собираю preview beauty web-сводки для админов без отправки в канал..."
+        )
+        try:
+            result = await run_marketing_web_job(raw_args)
+        except Exception as e:
+            log.exception("runmweb fail: %s", e)
+            await notice.edit_text(f"❌ Не получилось запустить beauty web-сводку: {e}")
         else:
             await notice.edit_text(result)
 
@@ -1106,6 +1129,8 @@ def build_router(
             "<code>/runjob send marketing 2026-05-25</code> — отправить категорию за дату\n"
             "<code>/runvc</code> — preview отдельной VC.ru-сводки по Ozon/WB\n"
             "<code>/runvc send</code> — отправить VC.ru-сводку в MP-чат\n"
+            "<code>/runmweb</code> — preview beauty web-сводки по TikTok/Instagram\n"
+            "<code>/runmweb send</code> — отправить beauty web-сводку в marketing-чат\n"
             "<code>/queue today all</code> — посмотреть накопленные посты\n"
             "<code>/queue today all quarantine</code> — посмотреть отсеянное\n"
             "<code>/clearqueue today all</code> — очистить очередь вручную\n"
@@ -1115,7 +1140,7 @@ def build_router(
             "<code>/checkchannels</code> — проверить доступ к каналам\n"
             "<code>/catchup 36</code> — окно догоняющего сканера в часах\n"
             "<code>/cancel</code> — сбросить текущий ввод\n\n"
-            "💡 Бот копит посты весь день по московской дате и после 09:00 МСК отправляет сводку за вчера. VC.ru-сводка идёт отдельным сообщением после неё."
+            "💡 Бот копит посты весь день по московской дате и после 09:00 МСК отправляет сводку за вчера. VC.ru и beauty web-сводки идут отдельными сообщениями после неё."
         )
         await c.message.edit_text(text, reply_markup=main_menu_kb())
         await c.answer()
@@ -1225,6 +1250,7 @@ async def run_admin_bot(
     conn,
     run_job: Callable[[str | None], Awaitable[str]] | None = None,
     run_vc_job: Callable[[str | None], Awaitable[str]] | None = None,
+    run_marketing_web_job: Callable[[str | None], Awaitable[str]] | None = None,
     health_check: Callable[[], Awaitable[str]] | None = None,
     check_channels: Callable[[], Awaitable[str]] | None = None,
 ) -> None:
@@ -1236,6 +1262,7 @@ async def run_admin_bot(
             bot,
             run_job=run_job,
             run_vc_job=run_vc_job,
+            run_marketing_web_job=run_marketing_web_job,
             health_check=health_check,
             check_channels=check_channels,
         )
