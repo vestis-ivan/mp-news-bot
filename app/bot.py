@@ -442,6 +442,7 @@ def urgent_alert_score(text: str, category: str) -> int:
 
 async def maybe_send_urgent_alert(
     out_bot: Bot,
+    client: TelegramClient,
     conn,
     *,
     username: str,
@@ -460,16 +461,28 @@ async def maybe_send_urgent_alert(
     if len(snippet) > 900:
         snippet = snippet[:900].rsplit(" ", 1)[0].strip() + "..."
     label = DAILY_CATEGORY_LABEL.get(category, category)
-    await send_to_admins(
-        out_bot,
-        conn,
-        (
-            f"🚨 <b>Срочный сигнал</b> · {html.escape(label)}\n\n"
-            f"Источник: <a href=\"{link}\">@{html.escape(username)}</a>\n"
-            f"Причина: похоже на важное изменение/дедлайн/деньги для селлера.\n\n"
-            f"{html.escape(snippet)}"
-        ),
+    alert_text = (
+        f"🚨 <b>Срочный сигнал</b> · {html.escape(label)}\n\n"
+        f"Источник: <a href=\"{link}\">@{html.escape(username)}</a>\n"
+        f"Причина: похоже на важное изменение/дедлайн/деньги для селлера.\n\n"
+        f"{html.escape(snippet)}"
     )
+    cfg = CFG.get("urgent_alerts", {})
+    target_sent = False
+    if cfg.get("send_to_target", True):
+        target_sent, chunks, total = await send_text_to_target(out_bot, client, conn, category, alert_text)
+        if target_sent:
+            log.info("[%s/%d] urgent alert -> target %s (%d/%d)", username, msg_id, category, chunks, total)
+        else:
+            log.warning("[%s/%d] urgent alert target send failed (%s, %d/%d)", username, msg_id, category, chunks, total)
+
+    if cfg.get("send_to_admins", True):
+        admin_text = alert_text
+        if cfg.get("send_to_target", True):
+            admin_text += "\n\n" + ("✅ Автоматически отправлено в целевой чат." if target_sent else "⚠️ В целевой чат отправить не удалось.")
+        await send_to_admins(out_bot, conn, admin_text)
+
+    st.bump_stat(conn, datetime.now(MSK).date().isoformat(), category, "urgent_alert")
     st.setting_set(conn, key, datetime.now(MSK).isoformat(timespec="seconds"))
 
 
@@ -528,6 +541,7 @@ async def handle_message_from_chat(out_bot: Bot, client: TelegramClient, conn, m
 
     await maybe_send_urgent_alert(
         out_bot,
+        client,
         conn,
         username=username,
         msg_id=msg.id,
