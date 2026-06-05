@@ -401,6 +401,17 @@ def daily_digest_fail_notice_key(day: str, category: str, send_hour: int) -> str
     return f"daily_digest_fail_notice:{day}:{category}:{send_hour}"
 
 
+def urgent_alert_daily_key(day: str) -> str:
+    return f"urgent_alert_sent:{day}"
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def urgent_alert_score(text: str, category: str) -> int:
     cfg = CFG.get("urgent_alerts", {})
     if not cfg.get("enabled", False):
@@ -440,6 +451,62 @@ def urgent_alert_score(text: str, category: str) -> int:
     return score if marketplace and score >= 3 else 0
 
 
+async def ai_check_urgent_importance(text: str, category: str, heuristic_score: int) -> tuple[bool, int, str]:
+    cfg = CFG.get("urgent_alerts", {})
+    min_score = safe_int(cfg.get("min_ai_score", 85), 85)
+    if not cfg.get("ai_importance_check", True):
+        fallback_score = min(100, max(0, heuristic_score * 12))
+        return True, fallback_score, "AI-проверка выключена, используется эвристика."
+    if not ai:
+        return False, 0, "OpenAI недоступен, срочный сигнал не отправлен."
+
+    sample = text.strip()
+    max_chars = safe_int(cfg.get("max_chars", 2500), 2500)
+    sample = sample[:max_chars]
+    category_label = DAILY_CATEGORY_LABEL.get(category, category)
+    try:
+        resp = await ai.chat.completions.create(
+            model=CFG["ai"]["model"],
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты строгий редактор срочных сигналов для российских селлеров Ozon/Wildberries. "
+                        "Нужно решить, заслуживает ли пост отдельного мгновенного пуша, если лимит всего 1 сигнал в день. "
+                        "Верни только JSON без markdown: "
+                        "{\"urgent\": true/false, \"score\": 0-100, \"reason\": \"коротко\"}. "
+                        "Ставь urgent=true только если продавец может потерять деньги, получить блокировку/штраф, "
+                        "пропустить дедлайн, столкнуться с изменением тарифов/комиссий/маркировки/API/поставок, "
+                        "или должен срочно проверить кабинет/карточки/рекламу. "
+                        "Обычные новости, мнения, слухи, вебинары, самопиар, кейсы без массового действия, "
+                        "повторы и просто полезные советы должны быть urgent=false. "
+                        "Для urgent=true score обычно 85-100. Если сомневаешься, urgent=false."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Категория: {category_label}\n"
+                        f"Эвристический балл: {heuristic_score}\n\n"
+                        f"Пост:\n{sample}"
+                    ),
+                },
+            ],
+            max_tokens=140,
+            temperature=0,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        match = re.search(r"\{.*\}", raw, flags=re.S)
+        data = json.loads(match.group(0) if match else raw)
+        score = safe_int(data.get("score", 0), 0)
+        reason = str(data.get("reason", "")).strip()[:300]
+        urgent = bool(data.get("urgent")) and score >= min_score
+        return urgent, score, reason or "AI подтвердил важность."
+    except Exception as e:
+        log.warning("OpenAI urgent importance check fail: %s", e)
+        return False, 0, f"AI-проверка срочности упала: {e}"
+
+
 async def maybe_send_urgent_alert(
     out_bot: Bot,
     client: TelegramClient,
@@ -450,12 +517,29 @@ async def maybe_send_urgent_alert(
     category: str,
     text: str,
 ) -> None:
+    today = datetime.now(MSK).date().isoformat()
+    cfg = CFG.get("urgent_alerts", {})
+    daily_limit = safe_int(cfg.get("daily_limit", 1), 1)
+    if daily_limit <= 0:
+        return
+    daily_key = urgent_alert_daily_key(today)
+    daily_sent = safe_int(st.setting_get(conn, daily_key, "0"), 0)
+    if daily_sent >= daily_limit:
+        return
+
     score = urgent_alert_score(text, category)
     if not score:
         return
     key = f"urgent_alert:{username}:{msg_id}"
     if st.setting_get(conn, key):
         return
+    is_urgent, ai_score, ai_reason = await ai_check_urgent_importance(text, category, score)
+    if not is_urgent:
+        st.bump_stat(conn, today, category, "urgent_alert_rejected")
+        st.setting_set(conn, key, f"rejected:{ai_score}:{datetime.now(MSK).isoformat(timespec='seconds')}")
+        log.info("[%s/%d] urgent rejected by AI (%s): %s", username, msg_id, ai_score, ai_reason)
+        return
+
     link = f"https://t.me/{username}/{msg_id}"
     snippet = text.replace("\n", " ").strip()
     if len(snippet) > 900:
@@ -464,10 +548,10 @@ async def maybe_send_urgent_alert(
     alert_text = (
         f"🚨 <b>Срочный сигнал</b> · {html.escape(label)}\n\n"
         f"Источник: <a href=\"{link}\">@{html.escape(username)}</a>\n"
-        f"Причина: похоже на важное изменение/дедлайн/деньги для селлера.\n\n"
+        f"Причина: {html.escape(ai_reason)}\n"
+        f"Важность: {ai_score}/100\n\n"
         f"{html.escape(snippet)}"
     )
-    cfg = CFG.get("urgent_alerts", {})
     target_sent = False
     if cfg.get("send_to_target", True):
         target_sent, chunks, total = await send_text_to_target(out_bot, client, conn, category, alert_text)
@@ -482,8 +566,9 @@ async def maybe_send_urgent_alert(
             admin_text += "\n\n" + ("✅ Автоматически отправлено в целевой чат." if target_sent else "⚠️ В целевой чат отправить не удалось.")
         await send_to_admins(out_bot, conn, admin_text)
 
-    st.bump_stat(conn, datetime.now(MSK).date().isoformat(), category, "urgent_alert")
+    st.bump_stat(conn, today, category, "urgent_alert")
     st.setting_set(conn, key, datetime.now(MSK).isoformat(timespec="seconds"))
+    st.setting_set(conn, daily_key, str(daily_sent + 1))
 
 
 async def handle_message(out_bot: Bot, client: TelegramClient, conn, event: events.NewMessage.Event) -> None:

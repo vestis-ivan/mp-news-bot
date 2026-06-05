@@ -68,7 +68,11 @@ urgent_alerts:
   enabled: true
   send_to_admins: true
   send_to_target: true
+  daily_limit: 1
   min_text_length: 120
+  ai_importance_check: true
+  min_ai_score: 85
+  max_chars: 2500
   keywords:
     - "штраф"
     - "блокиров"
