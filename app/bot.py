@@ -283,7 +283,7 @@ def format_msg(*, source: str, title: str, msg_id: int, body: str, summary: str 
 
 async def send_to_target(
     out_bot: Bot, client: TelegramClient, conn, category: str, *,
-    text: str, media: Any = None,
+    text: str, media: Any = None, disable_web_page_preview: bool = False,
 ) -> bool:
     """Шлёт в целевой чат/тему ОТ ИМЕНИ БОТА (admin-bot должен быть админом канала).
 
@@ -316,7 +316,7 @@ async def send_to_target(
                     )
                     return True
         await out_bot.send_message(
-            chat_id, text, message_thread_id=thread_id, disable_web_page_preview=False,
+            chat_id, text, message_thread_id=thread_id, disable_web_page_preview=disable_web_page_preview,
         )
         return True
     except Exception as e:
@@ -330,6 +330,8 @@ async def send_text_to_target(
     conn,
     category: str,
     text: str,
+    *,
+    disable_web_page_preview: bool = False,
 ) -> tuple[bool, int, int]:
     chunks = chunk_text(text, 3900)
     if not chunks:
@@ -337,7 +339,14 @@ async def send_text_to_target(
 
     sent = 0
     for chunk in chunks:
-        if not await send_to_target(out_bot, client, conn, category, text=chunk):
+        if not await send_to_target(
+            out_bot,
+            client,
+            conn,
+            category,
+            text=chunk,
+            disable_web_page_preview=disable_web_page_preview,
+        ):
             return False, sent, len(chunks)
         sent += 1
     return True, sent, len(chunks)
@@ -345,7 +354,7 @@ async def send_text_to_target(
 
 # ---------- Обработка нового сообщения ----------------------------------------
 
-async def send_to_admins(out_bot: Bot, conn, text: str) -> int:
+async def send_to_admins(out_bot: Bot, conn, text: str, *, disable_web_page_preview: bool = False) -> int:
     sent = 0
     for admin in st.list_admins(conn):
         try:
@@ -353,7 +362,7 @@ async def send_to_admins(out_bot: Bot, conn, text: str) -> int:
                 await out_bot.send_message(
                     admin["user_id"],
                     chunk,
-                    disable_web_page_preview=False,
+                    disable_web_page_preview=disable_web_page_preview,
                 )
             sent += 1
         except Exception as e:
@@ -412,6 +421,30 @@ def safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+EMOJI_RE = re.compile(
+    "["
+    "\U0001F1E6-\U0001F1FF"
+    "\U0001F300-\U0001FAFF"
+    "\u2600-\u27BF"
+    "\uFE0F"
+    "\u200D"
+    "]+"
+)
+
+
+def clean_alert_field(value: Any, *, default: str = "", max_len: int = 280) -> str:
+    text = str(value or "").strip()
+    text = EMOJI_RE.sub("", text)
+    text = re.sub(r"[*_`~]+", "", text)
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"\s+", " ", text).strip(" -—:;,.")
+    if not text:
+        text = default
+    if len(text) > max_len:
+        text = text[:max_len].rsplit(" ", 1)[0].strip() + "..."
+    return text
+
+
 def urgent_alert_score(text: str, category: str) -> int:
     cfg = CFG.get("urgent_alerts", {})
     if not cfg.get("enabled", False):
@@ -451,14 +484,20 @@ def urgent_alert_score(text: str, category: str) -> int:
     return score if marketplace and score >= 3 else 0
 
 
-async def ai_check_urgent_importance(text: str, category: str, heuristic_score: int) -> tuple[bool, int, str]:
+async def ai_check_urgent_importance(text: str, category: str, heuristic_score: int) -> tuple[bool, int, dict[str, str]]:
     cfg = CFG.get("urgent_alerts", {})
     min_score = safe_int(cfg.get("min_ai_score", 85), 85)
     if not cfg.get("ai_importance_check", True):
         fallback_score = min(100, max(0, heuristic_score * 12))
-        return True, fallback_score, "AI-проверка выключена, используется эвристика."
+        return True, fallback_score, {
+            "reason": "Эвристика нашла критичные признаки в посте.",
+            "title": "Срочное изменение для селлеров",
+            "change": "Проверь источник: пост похож на важное изменение правил или денег.",
+            "deadline": "Срок уточни в источнике.",
+            "action": "Проверь кабинет, карточки, тарифы и настройки, связанные с этим изменением.",
+        }
     if not ai:
-        return False, 0, "OpenAI недоступен, срочный сигнал не отправлен."
+        return False, 0, {"reason": "OpenAI недоступен, срочный сигнал не отправлен."}
 
     sample = text.strip()
     max_chars = safe_int(cfg.get("max_chars", 2500), 2500)
@@ -474,13 +513,17 @@ async def ai_check_urgent_importance(text: str, category: str, heuristic_score: 
                         "Ты строгий редактор срочных сигналов для российских селлеров Ozon/Wildberries. "
                         "Нужно решить, заслуживает ли пост отдельного мгновенного пуша, если лимит всего 1 сигнал в день. "
                         "Верни только JSON без markdown: "
-                        "{\"urgent\": true/false, \"score\": 0-100, \"reason\": \"коротко\"}. "
+                        "{\"urgent\": true/false, \"score\": 0-100, \"title\": \"короткий заголовок\", "
+                        "\"reason\": \"почему срочно\", \"change\": \"что меняется\", "
+                        "\"deadline\": \"дата/срок или пусто\", \"action\": \"что сделать селлеру\"}. "
                         "Ставь urgent=true только если продавец может потерять деньги, получить блокировку/штраф, "
                         "пропустить дедлайн, столкнуться с изменением тарифов/комиссий/маркировки/API/поставок, "
                         "или должен срочно проверить кабинет/карточки/рекламу. "
                         "Обычные новости, мнения, слухи, вебинары, самопиар, кейсы без массового действия, "
                         "повторы и просто полезные советы должны быть urgent=false. "
-                        "Для urgent=true score обычно 85-100. Если сомневаешься, urgent=false."
+                        "Для urgent=true score обычно 85-100. Если сомневаешься, urgent=false. "
+                        "Не копируй эмодзи, markdown, стикеры, украшения и длинные фразы из поста. "
+                        "Пиши деловым русским языком, коротко и по сути."
                     ),
                 },
                 {
@@ -499,12 +542,18 @@ async def ai_check_urgent_importance(text: str, category: str, heuristic_score: 
         match = re.search(r"\{.*\}", raw, flags=re.S)
         data = json.loads(match.group(0) if match else raw)
         score = safe_int(data.get("score", 0), 0)
-        reason = str(data.get("reason", "")).strip()[:300]
+        details = {
+            "reason": clean_alert_field(data.get("reason"), default="AI подтвердил важность.", max_len=180),
+            "title": clean_alert_field(data.get("title"), default="Срочное изменение для селлеров", max_len=120),
+            "change": clean_alert_field(data.get("change"), default="Проверь источник: пост описывает важное изменение.", max_len=360),
+            "deadline": clean_alert_field(data.get("deadline"), default="", max_len=120),
+            "action": clean_alert_field(data.get("action"), default="Проверь кабинет и связанные настройки.", max_len=360),
+        }
         urgent = bool(data.get("urgent")) and score >= min_score
-        return urgent, score, reason or "AI подтвердил важность."
+        return urgent, score, details
     except Exception as e:
         log.warning("OpenAI urgent importance check fail: %s", e)
-        return False, 0, f"AI-проверка срочности упала: {e}"
+        return False, 0, {"reason": f"AI-проверка срочности упала: {e}"}
 
 
 async def maybe_send_urgent_alert(
@@ -533,28 +582,45 @@ async def maybe_send_urgent_alert(
     key = f"urgent_alert:{username}:{msg_id}"
     if st.setting_get(conn, key):
         return
-    is_urgent, ai_score, ai_reason = await ai_check_urgent_importance(text, category, score)
+    is_urgent, ai_score, ai_details = await ai_check_urgent_importance(text, category, score)
     if not is_urgent:
         st.bump_stat(conn, today, category, "urgent_alert_rejected")
         st.setting_set(conn, key, f"rejected:{ai_score}:{datetime.now(MSK).isoformat(timespec='seconds')}")
-        log.info("[%s/%d] urgent rejected by AI (%s): %s", username, msg_id, ai_score, ai_reason)
+        log.info("[%s/%d] urgent rejected by AI (%s): %s", username, msg_id, ai_score, ai_details.get("reason", ""))
         return
 
     link = f"https://t.me/{username}/{msg_id}"
-    snippet = text.replace("\n", " ").strip()
-    if len(snippet) > 900:
-        snippet = snippet[:900].rsplit(" ", 1)[0].strip() + "..."
     label = DAILY_CATEGORY_LABEL.get(category, category)
+    title = ai_details.get("title") or "Срочное изменение для селлеров"
+    reason = ai_details.get("reason") or "AI подтвердил важность."
+    change = ai_details.get("change") or "Проверь источник: пост описывает важное изменение."
+    deadline = ai_details.get("deadline") or ""
+    action = ai_details.get("action") or "Проверь кабинет и связанные настройки."
+
+    detail_lines = [
+        f"📌 <b>Что меняется:</b> {html.escape(change)}",
+    ]
+    if deadline:
+        detail_lines.append(f"⏱ <b>Срок:</b> {html.escape(deadline)}")
+    detail_lines.append(f"✅ <b>Что сделать:</b> {html.escape(action)}")
+
     alert_text = (
-        f"🚨 <b>Срочный сигнал</b> · {html.escape(label)}\n\n"
-        f"Источник: <a href=\"{link}\">@{html.escape(username)}</a>\n"
-        f"Причина: {html.escape(ai_reason)}\n"
-        f"Важность: {ai_score}/100\n\n"
-        f"{html.escape(snippet)}"
+        f"🚨 <b>{html.escape(title)}</b>\n"
+        f"{html.escape(label)} · важность {ai_score}/100\n\n"
+        f"🧠 <b>Почему срочно:</b> {html.escape(reason)}\n\n"
+        + "\n".join(detail_lines)
+        + f"\n\nИсточник: <a href=\"{link}\">@{html.escape(username)}</a>"
     )
     target_sent = False
     if cfg.get("send_to_target", True):
-        target_sent, chunks, total = await send_text_to_target(out_bot, client, conn, category, alert_text)
+        target_sent, chunks, total = await send_text_to_target(
+            out_bot,
+            client,
+            conn,
+            category,
+            alert_text,
+            disable_web_page_preview=True,
+        )
         if target_sent:
             log.info("[%s/%d] urgent alert -> target %s (%d/%d)", username, msg_id, category, chunks, total)
         else:
@@ -564,7 +630,7 @@ async def maybe_send_urgent_alert(
         admin_text = alert_text
         if cfg.get("send_to_target", True):
             admin_text += "\n\n" + ("✅ Автоматически отправлено в целевой чат." if target_sent else "⚠️ В целевой чат отправить не удалось.")
-        await send_to_admins(out_bot, conn, admin_text)
+        await send_to_admins(out_bot, conn, admin_text, disable_web_page_preview=True)
 
     st.bump_stat(conn, today, category, "urgent_alert")
     st.setting_set(conn, key, datetime.now(MSK).isoformat(timespec="seconds"))
