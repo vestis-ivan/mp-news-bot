@@ -1431,7 +1431,17 @@ def render_marketing_web_digest(day: str, items: list[dict[str, Any]], ai_data: 
     except ValueError:
         display_day = day
 
-    blocks = [f"💄 TikTok/Instagram beauty-сводка за {display_day}"]
+    cfg = CFG.get("marketing_web_digest", {})
+    schedule = str(cfg.get("schedule", "daily")).lower()
+    period_days = safe_int(cfg.get("period_days", 7), 7)
+    if schedule == "weekly":
+        header = f"💄 Еженедельная TikTok/Instagram beauty-сводка за неделю до {display_day}"
+    else:
+        header = f"💄 TikTok/Instagram beauty-сводка за {display_day}"
+    if schedule == "weekly" and period_days > 0:
+        header += f" · последние {period_days} дней"
+
+    blocks = [header]
     added = 0
     for raw in raw_ideas:
         if not isinstance(raw, dict):
@@ -1906,6 +1916,11 @@ async def marketing_web_digest_worker(out_bot: Bot, client: TelegramClient, conn
             if not cfg.get("enabled", True):
                 continue
             now = datetime.now(MSK)
+            schedule = str(cfg.get("schedule", "daily")).lower()
+            if schedule == "weekly":
+                send_weekday = safe_int(cfg.get("send_weekday_msk", 0), 0)
+                if now.weekday() != send_weekday:
+                    continue
             send_hour = int(cfg.get("send_hour_msk", 9))
             send_minute = int(cfg.get("send_minute_msk", 40))
             if (now.hour, now.minute) < (send_hour, send_minute):

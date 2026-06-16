@@ -39,9 +39,12 @@ vc_digest:
 marketing_web_digest:
   enabled: true
   category: marketing
+  schedule: weekly
+  send_weekday_msk: 0
   send_hour_msk: 9
   send_minute_msk: 40
-  max_age_hours: 96
+  period_days: 7
+  max_age_hours: 168
   max_items: 35
   max_tokens: 2600
   sources:
