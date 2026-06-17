@@ -4,9 +4,9 @@
   1) Telethon user-client — слушает каналы-источники и заливает в БД-очереди.
   2) aiogram bot — админ-панель в Telegram.
 
-И два таймера:
-  3) Дайджест ozon_novosti (каждый час 09-21 МСК).
-  4) Дайджест уикэнд-постов (пн 09:00 МСК).
+И таймеры:
+  3) Недельные AI-дайджесты Telegram/VC.ru/Ozon/marketing web по расписанию.
+  4) Legacy-воркеры для старых очередей без мгновенной рассылки.
 
 Источник правды — SQLite (data/state.db). config.yaml только для первичного посева.
 """
@@ -402,6 +402,34 @@ def filtered_ad_count(day_stats, category: str) -> int:
     return day_stats.get((category, "blocked_ad"), 0) + day_stats.get((category, "blocked_ai_ad"), 0)
 
 
+def digest_period_days(end_day: str, period_days: int = 7) -> tuple[list[str], str]:
+    try:
+        end = datetime.strptime(end_day, "%Y-%m-%d").date()
+    except ValueError:
+        return [end_day], end_day
+    period_days = max(1, period_days)
+    start = end - timedelta(days=period_days - 1)
+    days = [(start + timedelta(days=i)).isoformat() for i in range(period_days)]
+    label = f"{start.strftime('%d.%m')}–{end.strftime('%d.%m')}"
+    return days, label
+
+
+def list_daily_rows_for_days(conn, days: list[str], category: str) -> list[Any]:
+    rows: list[Any] = []
+    for day in days:
+        rows.extend(st.list_bucket(conn, daily_bucket(day, category)))
+    return rows
+
+
+def delete_daily_buckets_for_days(conn, days: list[str], category: str) -> None:
+    for day in days:
+        st.delete_bucket(conn, daily_bucket(day, category))
+
+
+def filtered_ad_count_for_days(conn, days: list[str], category: str) -> int:
+    return sum(filtered_ad_count(st.stats_for_day(conn, day), category) for day in days)
+
+
 def daily_digest_done_key(day: str, category: str, send_hour: int) -> str:
     return f"last_daily_digest:{day}:{category}:{send_hour}"
 
@@ -759,7 +787,14 @@ def _daily_rows_payload(rows: list[Any], max_chars: int) -> tuple[str, int]:
     return "\n---\n".join(parts), used
 
 
-async def summarize_daily(category: str, day: str, rows: list[Any], filtered_ads: int) -> str | None:
+async def summarize_daily(
+    category: str,
+    day: str,
+    rows: list[Any],
+    filtered_ads: int,
+    *,
+    period_label: str | None = None,
+) -> str | None:
     if not ai or not rows:
         return None
 
@@ -774,6 +809,8 @@ async def summarize_daily(category: str, day: str, rows: list[Any], filtered_ads
         display_day = datetime.strptime(day, "%Y-%m-%d").strftime("%d.%m")
     except ValueError:
         display_day = day
+    period_display = period_label or display_day
+    block_limit = "6-8" if category == "marketing" else "8-12"
     if category == "marketing":
         category_focus = """
 Фокус категории "Маркетинг":
@@ -789,10 +826,10 @@ async def summarize_daily(category: str, day: str, rows: list[Any], filtered_ads
 - Отдельные корпоративные/финансовые новости включай только если они могут повлиять на селлеров практически.
 """.strip()
     prompt = f"""
-Сделай редакторский дайджест новостей для владельца/менеджера маркетплейсов.
+Сделай редакторский недельный дайджест новостей для владельца/менеджера маркетплейсов.
 
 Нужен формат как у живого новостного редактора: не таблица, не список всех постов,
-а короткая лента самых важных событий с поясняющими подпунктами.
+а короткая лента самых-самых важных событий недели с поясняющими подпунктами.
 
 Оцени каждый пост:
 3 — важно/срочно: правила, сроки, штрафы, блокировки, комиссии, поставки, реклама, деньги, новые инструменты, крупные изменения.
@@ -800,23 +837,25 @@ async def summarize_daily(category: str, day: str, rows: list[Any], filtered_ads
 1 — слабый сигнал: мнение, частная история, обсуждение без нового факта.
 0 — шум: повторы, самопиар, анонсы эфиров/курсов, опросы, эмоции, нерелевантное.
 
-В итог включай только приоритет 2-3. Приоритет 0-1 не расписывай.
+В итог включай только самые сильные новости приоритета 3 и редкие новости приоритета 2, если они дают практическую пользу.
+Приоритет 0-1 не расписывай. Не пытайся уместить все посты недели.
 Если важных новостей мало — сделай короткий дайджест, не добивай объемом.
+Жесткий лимит: максимум {block_limit} блоков, если нет действительно критичных исключений.
 
 {category_focus}
 
 Приоритет площадок:
 - Ozon — главный фокус дайджеста. При прочих равных выбирай новости Ozon выше WB.
-- Если за день есть достаточно важных новостей Ozon, дай им примерно 60-70% блоков.
+- Если за период есть достаточно важных новостей Ozon, дай им примерно 60-70% блоков.
 - WB тоже включай, но только самые важные изменения: правила, тарифы, логистика, штрафы, карточки, реклама, официальные новости.
 - Не выкидывай критически важный WB ради слабой новости Ozon. Важность факта важнее бренда, но при равной важности побеждает Ozon.
 - Новости не про Ozon/WB включай только если они прямо важны селлерам маркетплейсов.
 
 Строгий формат ответа:
 
-📋 Дайджест новостей за {display_day}:
+📋 Главные новости недели за {period_display}:
 
-🖇Короткий заголовок новости (https://source/link)
+🖇[Короткий привлекательный заголовок новости](https://source/link)
 
 -Что изменилось или произошло.
 
@@ -824,15 +863,16 @@ async def summarize_daily(category: str, day: str, rows: list[Any], filtered_ads
 
 -Что стоит сделать или проверить, если из новости следует действие.
 
-🖇Следующая важная новость (https://source/link)
+🖇[Следующая важная новость](https://source/link)
 
 -...
 
 Правила оформления:
-- Без markdown, без жирного текста, без HTML.
+- Без HTML и без жирного текста.
+- Ссылки оформляй только так: [привлекательные слова](https://source/link). Не выводи голые URL.
 - Один важный инфоповод = один блок. Если 2-5 постов говорят об одном событии, объедини их в один блок и оставь самую сильную ссылку.
 - Заголовок начинай с 🖇, а особо денежные/практичные штуки можно начать с 👍.
-- Ссылку ставь прямо в заголовок в скобках. Если ссылки нет в посте, используй ссылку Telegram-источника вида https://t.me/channel/123.
+- Ссылку ставь прямо в заголовок через markdown-ссылку. Если ссылки нет в посте, используй ссылку Telegram-источника вида https://t.me/channel/123.
 - Под каждым заголовком дай 2-4 подпункта через дефис, как в примере.
 - Почти в каждом блоке должен быть прикладной пункт "Что сделать:" или "Что проверить:", если из новости следует действие.
 - Если из новости можно вывести полезную идею для теста, добавь подпункт "Гипотеза:".
@@ -840,11 +880,12 @@ async def summarize_daily(category: str, day: str, rows: list[Any], filtered_ads
 - Не добавляй в дайджест рекламу, самопиар, опросы, анонсы вебинаров, мнения без фактов и мелкие истории без вывода.
 - Не придумывай факты, цифры, сроки, причины и выводы. Если детали нет в постах — не добавляй ее.
 - Сортируй новости по важности для селлера.
-- Включай все важные новости приоритета 2-3, которые есть в очереди. Не ограничивайся одним сообщением: бот сам разобьет длинный дайджест на несколько сообщений.
-- Если важных новостей много, максимум 20-25 блоков. Если важных мало, лучше коротко.
+- Это недельная выжимка: выбери лучшее за неделю, не пересказывай весь архив.
+- Если важных новостей много, максимум {block_limit} блоков. Если важных мало, лучше коротко.
 
 Категория: {category_label}
-Дата сбора: {day}
+Период: {period_display}
+Дата конца периода: {day}
 Всего постов в очереди: {len(rows)}
 Постов передано в анализ: {used}
 Реклама/самопиар, отфильтрованные до анализа: {filtered_ads}
@@ -857,7 +898,7 @@ async def summarize_daily(category: str, day: str, rows: list[Any], filtered_ads
         resp = await ai.chat.completions.create(
             model=CFG["ai"]["model"],
             messages=[
-                {"role": "system", "content": "Ты сильный редактор ежедневной сводки по маркетплейсам."},
+                {"role": "system", "content": "Ты сильный редактор еженедельной сводки по маркетплейсам. Выбирай только самое важное."},
                 {"role": "user", "content": prompt},
             ],
             max_tokens=int(daily_cfg.get("max_tokens", 1200)),
@@ -869,12 +910,59 @@ async def summarize_daily(category: str, day: str, rows: list[Any], filtered_ads
         return None
 
 
+def _clean_link_title(value: str, default: str = "источник") -> str:
+    text = re.sub(r"<[^>]+>", " ", value or "")
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip(" -\n\t")
+    if not text:
+        return default
+    if len(text) > 180:
+        text = text[:180].rsplit(" ", 1)[0].strip()
+    return text or default
+
+
+def _normalize_title_url_lines(text: str) -> str:
+    lines: list[str] = []
+    pattern = re.compile(r"^(\s*[🖇👍]\s*)(.+?)\s*\((https?://[^)\s<>]+)\)\s*$")
+    for line in (text or "").splitlines():
+        m = pattern.match(line)
+        if m and "[" not in m.group(2):
+            title = _clean_link_title(m.group(2), "открыть новость")
+            line = f"{m.group(1)}[{title}]({m.group(3)})"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def pretty_links_to_html(text: str) -> str:
+    text = _normalize_title_url_lines(text or "")
+    pattern = re.compile(
+        r"\[([^\]\n]{1,220})\]\((https?://[^\s<>)]+)\)"
+        r"|(?<![\"'=])(https?://[^\s<>)]+)"
+    )
+    out: list[str] = []
+    last = 0
+    for m in pattern.finditer(text):
+        out.append(html.escape(text[last:m.start()]))
+        if m.group(1) and m.group(2):
+            title = _clean_link_title(m.group(1), "открыть источник")
+            url = m.group(2).rstrip(".,;")
+        else:
+            title = "источник"
+            url = (m.group(3) or "").rstrip(".,;")
+        out.append(f'<a href="{html.escape(url, quote=True)}">{html.escape(title)}</a>')
+        last = m.end()
+    out.append(html.escape(text[last:]))
+    return "".join(out)
+
+
 def build_daily_digest_text(
     category: str,
     day: str,
     rows: list[Any],
     summary: str | None,
     filtered_ads: int,
+    *,
+    period_label: str | None = None,
 ) -> str:
     daily_cfg = CFG.get("daily_digest", {})
     max_links = int(daily_cfg.get("max_source_links", 25))
@@ -882,12 +970,13 @@ def build_daily_digest_text(
         display_day = datetime.strptime(day, "%Y-%m-%d").strftime("%d.%m")
     except ValueError:
         display_day = day
+    display_period = period_label or display_day
 
     if summary:
-        return html.escape(summary)
+        return pretty_links_to_html(summary)
     else:
         parts = [
-            f"📋 Дайджест новостей за {html.escape(display_day)}:",
+            f"📋 Главные новости недели за {html.escape(display_period)}:",
         ]
         for i, r in enumerate(rows[:8], 1):
             source = str(r["source"]).strip().lstrip("@")
@@ -896,7 +985,7 @@ def build_daily_digest_text(
             if len(snippet) > 220:
                 snippet = snippet[:220].rsplit(" ", 1)[0].strip() + "..."
             parts.append("")
-            parts.append(f"🖇@{html.escape(source)} ({link})")
+            parts.append(f'🖇<a href="{html.escape(link, quote=True)}">Новость от @{html.escape(source)}</a>')
             parts.append(f"-{html.escape(snippet)}")
         parts.extend([
             "",
@@ -906,7 +995,7 @@ def build_daily_digest_text(
         for r in rows[:max_links]:
             source = str(r["source"]).strip().lstrip("@")
             link = f"https://t.me/{source}/{r['msg_id']}"
-            source_lines.append(f'— <a href="{link}">@{html.escape(source)}</a>')
+            source_lines.append(f'— <a href="{html.escape(link, quote=True)}">@{html.escape(source)}</a>')
         if len(rows) > max_links:
             source_lines.append(f"— еще {len(rows) - max_links} постов сохранены в архив")
 
@@ -1052,7 +1141,13 @@ def _parse_ai_json_object(text: str) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def _render_vc_digest(day: str, items: list[dict[str, Any]], ai_data: dict[str, Any]) -> str | None:
+def _render_vc_digest(
+    day: str,
+    items: list[dict[str, Any]],
+    ai_data: dict[str, Any],
+    *,
+    period_label: str | None = None,
+) -> str | None:
     by_id = {int(item["id"]): item for item in items}
     raw_items = ai_data.get("items")
     if not isinstance(raw_items, list):
@@ -1062,8 +1157,9 @@ def _render_vc_digest(day: str, items: list[dict[str, Any]], ai_data: dict[str, 
         display_day = datetime.strptime(day, "%Y-%m-%d").strftime("%d.%m")
     except ValueError:
         display_day = day
+    display_period = period_label or display_day
 
-    blocks = [f"📋 VC.ru: важное про Ozon/WB за {display_day}"]
+    blocks = [f"📋 VC.ru: главное про Ozon/WB за {html.escape(display_period)}"]
     added = 0
     for raw in raw_items:
         if not isinstance(raw, dict):
@@ -1089,10 +1185,10 @@ def _render_vc_digest(day: str, items: list[dict[str, Any]], ai_data: dict[str, 
             title = str(source["title"]).strip() or "Материал vc.ru"
         url = str(source["url"])
         block = [
-            f"🖇{title} ({url})",
-            f"- {clean_theses[0]}",
-            f"- {clean_theses[1]}",
-            f"- {clean_theses[2]}",
+            f'🖇<a href="{html.escape(url, quote=True)}">{html.escape(title)}</a>',
+            f"- {html.escape(clean_theses[0])}",
+            f"- {html.escape(clean_theses[1])}",
+            f"- {html.escape(clean_theses[2])}",
         ]
         blocks.append("\n\n".join(block))
         added += 1
@@ -1104,7 +1200,12 @@ def _render_vc_digest(day: str, items: list[dict[str, Any]], ai_data: dict[str, 
     return "\n\n".join(blocks)
 
 
-async def summarize_vc_digest(day: str, items: list[dict[str, Any]]) -> str | None:
+async def summarize_vc_digest(
+    day: str,
+    items: list[dict[str, Any]],
+    *,
+    period_label: str | None = None,
+) -> str | None:
     if not ai or not items:
         return None
     payload = vc_payload(items)
@@ -1114,9 +1215,10 @@ async def summarize_vc_digest(day: str, items: list[dict[str, Any]]) -> str | No
         display_day = datetime.strptime(day, "%Y-%m-%d").strftime("%d.%m")
     except ValueError:
         display_day = day
+    display_period = period_label or display_day
 
     prompt = f"""
-Выбери важные материалы vc.ru для селлера маркетплейсов и верни JSON.
+Выбери самые важные материалы vc.ru за период {display_period} для селлера маркетплейсов и верни JSON.
 Не пересказывай "о чём статья". Нужна суть: конкретные факты, последствия и что селлеру стоит проверить.
 
 Главный фокус — Ozon. Wildberries можно добавить немного, только если новость реально важная.
@@ -1144,7 +1246,7 @@ async def summarize_vc_digest(day: str, items: list[dict[str, Any]]) -> str | No
 Правила:
 - Ozon должен занимать примерно 70-80% дайджеста, если есть подходящие материалы.
 - WB добавляй только после Ozon и только важное.
-- Максимум 6-8 материалов.
+- Это недельная выжимка: максимум 5-7 самых важных материалов, не список всех публикаций.
 - В каждом материале должно быть ровно 3 содержательных тезиса.
 - Не пиши общие фразы вроде "в статье рассказывается", "обсуждаются причины", "описываются изменения".
 - Если в материале не хватает данных на 3 полезных тезиса для селлера, не включай этот материал.
@@ -1171,7 +1273,7 @@ async def summarize_vc_digest(day: str, items: list[dict[str, Any]]) -> str | No
         if not data:
             log.warning("OpenAI vc digest returned non-json: %s", text[:300])
             return None
-        return _render_vc_digest(day, items, data)
+        return _render_vc_digest(day, items, data, period_label=period_label)
     except Exception as e:
         log.warning("OpenAI vc digest fail: %s", e)
         return None
@@ -1194,16 +1296,20 @@ async def run_vc_digest_once(
     day = now.date().isoformat()
     send_hour = int(cfg.get("send_hour_msk", 9))
     send_minute = int(cfg.get("send_minute_msk", 20))
+    schedule = str(cfg.get("schedule", "daily")).lower()
+    period_days = safe_int(cfg.get("period_days", 7), 7)
+    end_day = (now.date() - timedelta(days=1)).isoformat() if schedule == "weekly" else day
+    _, period_label = digest_period_days(end_day, period_days)
     category = str(cfg.get("category", "mp_news"))
     if send_target and not st.get_target(conn, category):
         return f"❌ VC.ru-сводку не отправляю: нет целевого чата/темы для {category}. Задай /here {category}."
 
-    setting_key = f"{day}:{send_hour}:{send_minute}"
+    setting_key = f"{day}:{send_hour}:{send_minute}:{schedule}"
     if not force and st.setting_get(conn, "last_vc_digest") == setting_key:
         return f"ℹ️ VC.ru-сводка за {day} уже была обработана."
 
     items = await fetch_vc_candidates(
-        max_age_hours=float(cfg.get("max_age_hours", 72)),
+        max_age_hours=float(cfg.get("max_age_hours", period_days * 24)),
         max_items=int(cfg.get("max_items", 30)),
     )
     if not items:
@@ -1212,7 +1318,7 @@ async def run_vc_digest_once(
             st.setting_set(conn, "last_vc_digest_result", "no keyword candidates")
         return "ℹ️ VC.ru: за период не нашёл материалов про Ozon/WB."
 
-    summary = await summarize_vc_digest(day, items)
+    summary = await summarize_vc_digest(end_day, items, period_label=period_label if schedule == "weekly" else None)
     if not summary:
         if not force:
             st.setting_set(conn, "last_vc_digest", setting_key)
@@ -1223,8 +1329,10 @@ async def run_vc_digest_once(
     chunks = 0
     total_chunks = 0
     if send_target:
-        sent, chunks, total_chunks = await send_text_to_target(out_bot, client, conn, category, summary)
-    admin_copies = await send_to_admins(out_bot, conn, summary) if send_admins_copy else 0
+        sent, chunks, total_chunks = await send_text_to_target(
+            out_bot, client, conn, category, summary, disable_web_page_preview=True
+        )
+    admin_copies = await send_to_admins(out_bot, conn, summary, disable_web_page_preview=True) if send_admins_copy else 0
 
     if sent:
         if not force:
@@ -1466,10 +1574,10 @@ def render_marketing_web_digest(day: str, items: list[dict[str, Any]], ai_data: 
 
         title = html.escape(angle)
         source_name = html.escape(str(source["source"]))
-        url = html.escape(str(source["url"]), quote=False)
+        url = html.escape(str(source["url"]), quote=True)
         block = [
-            f"{added + 1}. <b>{title}</b>",
-            f"Источник: <a href=\"{url}\">{source_name}</a>",
+            f'{added + 1}. <a href="{url}">{title}</a>',
+            f"Источник: {source_name}",
             f"Суть: {html.escape(insight)}",
             f"Как применить: {html.escape(how)}",
             "Хуки:",
@@ -1485,7 +1593,8 @@ def render_marketing_web_digest(day: str, items: list[dict[str, Any]], ai_data: 
         clean_watch = [strip_html_text(str(x)).strip(" -\n\t") for x in watch if str(x).strip()]
         clean_watch = [x for x in clean_watch if len(x) >= 10][:3]
         if clean_watch:
-            blocks.append("📌 Что потестить сегодня:\n" + "\n".join(f"— {html.escape(x)}" for x in clean_watch))
+            watch_title = "📌 Что потестить на этой неделе:" if schedule == "weekly" else "📌 Что потестить сегодня:"
+            blocks.append(watch_title + "\n" + "\n".join(f"— {html.escape(x)}" for x in clean_watch))
 
     if not added:
         return None
@@ -1498,13 +1607,16 @@ async def summarize_marketing_web_digest(day: str, items: list[dict[str, Any]]) 
     payload = marketing_web_payload(items)
     if not payload:
         return None
+    cfg = CFG.get("marketing_web_digest", {})
+    schedule = str(cfg.get("schedule", "daily")).lower()
+    period_hint = "за неделю" if schedule == "weekly" else "на сегодня"
 
     prompt = f"""
 Ты стратег по TikTok/Instagram для beauty/cosmetics brands.
-На входе свежие материалы из зарубежных маркетинговых медиа. Переведи смысл на русский и сделай маленькую практическую сводку.
+На входе свежие материалы из зарубежных маркетинговых медиа. Переведи смысл на русский и сделай маленькую практическую сводку {period_hint}.
 
 Нужны не новости ради новостей, а идеи для контента, рекламных креативов, Reels/TikTok и UGC в нише косметики, ухода, макияжа, волос, парфюма.
-Пиши для человека, который продает/продвигает beauty-бренд и хочет сегодня снять/запустить что-то полезное.
+Пиши для человека, который продает/продвигает beauty-бренд и хочет снять/запустить что-то полезное.
 
 Верни строго JSON без markdown:
 {{
@@ -1522,7 +1634,7 @@ async def summarize_marketing_web_digest(day: str, items: list[dict[str, Any]]) 
     }}
   ],
   "watch": [
-    "Короткая гипотеза/тест на сегодня"
+    "Короткая гипотеза/тест на неделю"
   ]
 }}
 
@@ -1549,7 +1661,7 @@ async def summarize_marketing_web_digest(day: str, items: list[dict[str, Any]]) 
                 {"role": "system", "content": "Ты TikTok/Instagram strategist для beauty/cosmetics. Отвечай только валидным JSON на русском."},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=int(CFG.get("marketing_web_digest", {}).get("max_tokens", 2600)),
+            max_tokens=int(cfg.get("max_tokens", 2600)),
             response_format={"type": "json_object"},
             temperature=0.45,
         )
@@ -1581,11 +1693,12 @@ async def run_marketing_web_digest_once(
     day = now.date().isoformat()
     send_hour = int(cfg.get("send_hour_msk", 9))
     send_minute = int(cfg.get("send_minute_msk", 40))
+    schedule = str(cfg.get("schedule", "daily")).lower()
     category = str(cfg.get("category", "marketing"))
     if send_target and not st.get_target(conn, category):
         return f"❌ Beauty web-сводку не отправляю: нет целевого чата/темы для {category}. Задай /here {category}."
 
-    setting_key = f"{day}:{send_hour}:{send_minute}"
+    setting_key = f"{day}:{send_hour}:{send_minute}:{schedule}"
     if not force and st.setting_get(conn, "last_marketing_web_digest") == setting_key:
         return f"ℹ️ Beauty web-сводка за {day} уже была обработана."
 
@@ -1610,8 +1723,10 @@ async def run_marketing_web_digest_once(
     chunks = 0
     total_chunks = 0
     if send_target:
-        sent, chunks, total_chunks = await send_text_to_target(out_bot, client, conn, category, summary)
-    admin_copies = await send_to_admins(out_bot, conn, summary) if send_admins_copy else 0
+        sent, chunks, total_chunks = await send_text_to_target(
+            out_bot, client, conn, category, summary, disable_web_page_preview=True
+        )
+    admin_copies = await send_to_admins(out_bot, conn, summary, disable_web_page_preview=True) if send_admins_copy else 0
 
     if sent:
         if not force:
@@ -1703,7 +1818,7 @@ async def run_daily_digest_once(
 ) -> str:
     daily_cfg = CFG.get("daily_digest", {})
     if not daily_cfg.get("enabled", True) and not force:
-        return "⏸ Daily digest выключен в config.yaml."
+        return "⏸ Недельный дайджест выключен в config.yaml."
 
     send_hour = int(daily_cfg.get("send_hour_msk", 9))
     if day is None:
@@ -1721,7 +1836,7 @@ async def run_daily_digest_once(
     category_label = DAILY_CATEGORY_LABEL.get(category, "все категории") if category else "все категории"
     result_lines = [f"✅ Ручной запуск сводки за {day}: {mode}, {category_label}"]
     if not consume:
-        result_lines.append("Очередь не очищается: утренний дайджест в 09:00 МСК соберет полный день.")
+        result_lines.append("Очередь не очищается: плановый недельный дайджест по расписанию заберет эти посты позже.")
     if not send_target:
         result_lines.append("В целевой канал не отправляю: это preview для админов.")
 
@@ -1754,10 +1869,10 @@ async def run_daily_digest_once(
         target_total_chunks = 0
         if send_target:
             target_sent, target_chunks, target_total_chunks = await send_text_to_target(
-                out_bot, client, conn, cat, text
+                out_bot, client, conn, cat, text, disable_web_page_preview=True
             )
 
-        admin_copies = await send_to_admins(out_bot, conn, text) if send_admins_copy else 0
+        admin_copies = await send_to_admins(out_bot, conn, text, disable_web_page_preview=True) if send_admins_copy else 0
         target_note = ""
         if send_target:
             target_note = f", частей в целевой чат {target_chunks}/{target_total_chunks}"
@@ -1788,11 +1903,10 @@ async def run_daily_digest_once(
 
 
 async def daily_digest_worker(out_bot: Bot, client: TelegramClient, conn) -> None:
-    """Send yesterday's AI digest once a day after configured Moscow hour.
+    """Send AI digest on the configured Moscow schedule.
 
-    The worker deliberately keeps trying after the morning hour. This prevents
-    missed digests when the container restarts, Telegram/OpenAI hiccups, or
-    catch-up fills the queue a few minutes after 09:00.
+    In weekly mode it summarizes the previous full period, usually Monday-Sunday,
+    and keeps the queues intact until the target chat receives every chunk.
     """
     while True:
         await asyncio.sleep(60)
@@ -1802,24 +1916,36 @@ async def daily_digest_worker(out_bot: Bot, client: TelegramClient, conn) -> Non
                 continue
 
             now = datetime.now(MSK)
+            schedule = str(daily_cfg.get("schedule", "daily")).lower()
+            if schedule == "weekly":
+                send_weekday = safe_int(daily_cfg.get("send_weekday_msk", 0), 0)
+                if now.weekday() != send_weekday:
+                    continue
+
             send_hour = int(daily_cfg.get("send_hour_msk", 9))
             if now.hour < send_hour:
                 continue
 
-            day = (now.date() - timedelta(days=1)).isoformat()
-            setting_key = f"{day}:{send_hour}"
+            if schedule == "weekly":
+                period_days = safe_int(daily_cfg.get("period_days", 7), 7)
+                day = (now.date() - timedelta(days=1)).isoformat()
+                days, period_label = digest_period_days(day, period_days)
+                setting_key = f"{days[0]}:{day}:{send_hour}:weekly"
+            else:
+                day = (now.date() - timedelta(days=1)).isoformat()
+                days = [day]
+                period_label = None
+                setting_key = f"{day}:{send_hour}:daily"
 
-            day_stats = st.stats_for_day(conn, day)
             any_pending = False
             all_sent = True
 
             for cat in ("mp_news", "marketing"):
-                bucket = daily_bucket(day, cat)
                 category_done_key = daily_digest_done_key(day, cat, send_hour)
                 if st.setting_get(conn, category_done_key) == setting_key:
                     continue
 
-                rows = st.list_bucket(conn, bucket)
+                rows = list_daily_rows_for_days(conn, days, cat)
                 if not rows:
                     continue
 
@@ -1832,35 +1958,36 @@ async def daily_digest_worker(out_bot: Bot, client: TelegramClient, conn) -> Non
                             out_bot,
                             conn,
                             (
-                                f"⚠️ Утренний дайджест за {day} по категории {label} не отправился: "
+                                f"⚠️ Дайджест за {period_label or day} по категории {label} не отправился: "
                                 f"нет целевого чата/темы. Очередь сохранена, AI-сводку не собираю. "
                                 f"Задай /here {cat} в нужной теме."
                             ),
+                            disable_web_page_preview=True,
                         )
                         st.setting_set(conn, fail_key, setting_key)
                     continue
 
                 any_pending = True
-                filtered_ads = filtered_ad_count(day_stats, cat)
-                summary = await summarize_daily(cat, day, rows, filtered_ads)
+                filtered_ads = filtered_ad_count_for_days(conn, days, cat)
+                summary = await summarize_daily(cat, day, rows, filtered_ads, period_label=period_label)
                 if not summary and not daily_cfg.get("send_without_ai", False):
                     all_sent = False
                     log.warning("daily_digest %s %s skipped: AI summary unavailable", cat, day)
                     continue
-                text = build_daily_digest_text(cat, day, rows, summary, filtered_ads)
+                text = build_daily_digest_text(cat, day, rows, summary, filtered_ads, period_label=period_label)
 
                 sent, target_chunks, target_total_chunks = await send_text_to_target(
-                    out_bot, client, conn, cat, text
+                    out_bot, client, conn, cat, text, disable_web_page_preview=True
                 )
 
                 if sent:
-                    admin_copies = await send_to_admins(out_bot, conn, text)
-                    st.delete_bucket(conn, bucket)
+                    admin_copies = await send_to_admins(out_bot, conn, text, disable_web_page_preview=True)
+                    delete_daily_buckets_for_days(conn, days, cat)
                     st.bump_stat(conn, day, cat, "sent_daily_digest")
                     st.setting_set(conn, category_done_key, setting_key)
                     log.info(
-                        "daily_digest %s %s: %d posts, target chunks: %d/%d, admin copies: %d",
-                        cat, day, len(rows), target_chunks, target_total_chunks, admin_copies,
+                        "daily_digest %s %s: %d posts, period=%s, target chunks: %d/%d, admin copies: %d",
+                        cat, day, len(rows), period_label or day, target_chunks, target_total_chunks, admin_copies,
                     )
                 else:
                     all_sent = False
@@ -1871,10 +1998,11 @@ async def daily_digest_worker(out_bot: Bot, client: TelegramClient, conn) -> Non
                             out_bot,
                             conn,
                             (
-                                f"⚠️ Утренний дайджест за {day} по категории {label} не отправился "
+                                f"⚠️ Дайджест за {period_label or day} по категории {label} не отправился "
                                 "в целевой чат/тему. Очередь сохранена, полный дайджест админам повторно "
                                 "не рассылаю, чтобы не спамить. Проверь /here, права бота и /health."
                             ),
+                            disable_web_page_preview=True,
                         )
                         st.setting_set(conn, fail_key, setting_key)
 
@@ -1893,12 +2021,17 @@ async def vc_digest_worker(out_bot: Bot, client: TelegramClient, conn) -> None:
             if not cfg.get("enabled", True):
                 continue
             now = datetime.now(MSK)
+            schedule = str(cfg.get("schedule", "daily")).lower()
+            if schedule == "weekly":
+                send_weekday = safe_int(cfg.get("send_weekday_msk", 0), 0)
+                if now.weekday() != send_weekday:
+                    continue
             send_hour = int(cfg.get("send_hour_msk", 9))
             send_minute = int(cfg.get("send_minute_msk", 20))
             if (now.hour, now.minute) < (send_hour, send_minute):
                 continue
             day = now.date().isoformat()
-            setting_key = f"{day}:{send_hour}:{send_minute}"
+            setting_key = f"{day}:{send_hour}:{send_minute}:{schedule}"
             if st.setting_get(conn, "last_vc_digest") == setting_key:
                 continue
             result = await run_vc_digest_once(out_bot, client, conn, force=False)
@@ -1926,7 +2059,7 @@ async def marketing_web_digest_worker(out_bot: Bot, client: TelegramClient, conn
             if (now.hour, now.minute) < (send_hour, send_minute):
                 continue
             day = now.date().isoformat()
-            setting_key = f"{day}:{send_hour}:{send_minute}"
+            setting_key = f"{day}:{send_hour}:{send_minute}:{schedule}"
             if st.setting_get(conn, "last_marketing_web_digest") == setting_key:
                 continue
             result = await run_marketing_web_digest_once(out_bot, client, conn, force=False)
@@ -1935,35 +2068,58 @@ async def marketing_web_digest_worker(out_bot: Bot, client: TelegramClient, conn
             log.exception("marketing_web_digest fail: %s", e)
 
 
-async def hourly_digest_worker(out_bot: Bot, client: TelegramClient, conn) -> None:
-    """ozon_novosti — раз в час 09-21 МСК."""
-    last_hour: int | None = None
+async def ozon_legacy_digest_worker(out_bot: Bot, client: TelegramClient, conn) -> None:
+    """Legacy ozon_novosti bucket: send only as a weekly digest."""
     while True:
         await asyncio.sleep(60)
         try:
-            now = datetime.now(MSK)
-            if now.hour < 9 or now.hour > 21:
+            cfg = CFG.get("ozon_digest", {})
+            if not cfg.get("enabled", True):
                 continue
-            key = f"{now.date()}-{now.hour}"
+            now = datetime.now(MSK)
+            schedule = str(cfg.get("schedule", "weekly")).lower()
+            if schedule == "weekly":
+                send_weekday = safe_int(cfg.get("send_weekday_msk", 0), 0)
+                if now.weekday() != send_weekday:
+                    continue
+            send_hour = safe_int(cfg.get("send_hour_msk", 9), 9)
+            send_minute = safe_int(cfg.get("send_minute_msk", 30), 30)
+            if (now.hour, now.minute) < (send_hour, send_minute):
+                continue
+            key = f"{now.date()}:{send_hour}:{send_minute}:{schedule}"
             if st.setting_get(conn, "last_ozon_digest") == key:
                 continue
-            rows = st.pop_bucket(conn, "ozon_novosti")
-            st.setting_set(conn, "last_ozon_digest", key)
+            rows = st.list_bucket(conn, "ozon_novosti")
             if not rows:
+                st.setting_set(conn, "last_ozon_digest", key)
                 continue
-            header = f"🔔 <b>Обновления базы знаний Ozon</b> · {now.strftime('%H:%M %d.%m')}"
+
+            period_days = safe_int(cfg.get("period_days", 7), 7)
+            end_day = (now.date() - timedelta(days=1)).isoformat()
+            _, period_label = digest_period_days(end_day, period_days)
+            header = f"📋 <b>Ozon: главное за неделю {html.escape(period_label)}</b>"
             parts = [header]
             for r in rows:
-                snippet = r["text"][:300] + ("…" if len(r["text"]) > 300 else "")
+                source = str(r["source"]).strip().lstrip("@")
+                link = f"https://t.me/{source}/{r['msg_id']}"
+                snippet = str(r["text"]).replace("\n", " ").strip()
+                if len(snippet) > 300:
+                    snippet = snippet[:300].rsplit(" ", 1)[0].strip() + "..."
                 parts.append(
-                    f"• {snippet}\n"
-                    f'  <a href="https://t.me/{r["source"]}/{r["msg_id"]}">→ открыть</a>'
+                    f'• <a href="{html.escape(link, quote=True)}">Обновление от @{html.escape(source)}</a>\n'
+                    f'  {html.escape(snippet)}'
                 )
-            for chunk in chunk_text("\n\n".join(parts), 4000):
-                await send_to_target(out_bot, client, conn, "mp_news", text=chunk)
-            log.info("ozon_digest sent: %d posts", len(rows))
+            text = "\n\n".join(parts)
+            sent, chunks, total_chunks = await send_text_to_target(
+                out_bot, client, conn, "mp_news", text, disable_web_page_preview=True
+            )
+            if sent:
+                await send_to_admins(out_bot, conn, text, disable_web_page_preview=True)
+                st.delete_bucket(conn, "ozon_novosti")
+                st.setting_set(conn, "last_ozon_digest", key)
+            log.info("ozon_digest sent=%s: %d posts, chunks=%d/%d", sent, len(rows), chunks, total_chunks)
         except Exception as e:
-            log.exception("hourly_digest fail: %s", e)
+            log.exception("ozon_legacy_digest fail: %s", e)
 
 
 async def weekend_digest_worker(out_bot: Bot, client: TelegramClient, conn) -> None:
@@ -2223,6 +2379,8 @@ async def main() -> None:
     async def _health_check() -> str:
         today = datetime.now(MSK).date().isoformat()
         yesterday = (datetime.now(MSK).date() - timedelta(days=1)).isoformat()
+        period_days = safe_int(CFG.get("daily_digest", {}).get("period_days", 7), 7)
+        week_days, week_label = digest_period_days(today, period_days)
         openai_ok_now, openai_msg_now = await check_openai_status()
         st.setting_set(conn, "openai_status", "OK" if openai_ok_now else "FAIL")
         st.setting_set(conn, "openai_last_check_at", datetime.now(MSK).isoformat(timespec="seconds"))
@@ -2236,6 +2394,8 @@ async def main() -> None:
             f"Каналов: {len(st.list_channels(conn))}",
             f"Очередь сегодня MP: {st.queue_size(conn, daily_bucket(today, 'mp_news'))}",
             f"Очередь сегодня маркетинг: {st.queue_size(conn, daily_bucket(today, 'marketing'))}",
+            f"Очередь за {week_label} MP: {sum(st.queue_size(conn, daily_bucket(d, 'mp_news')) for d in week_days)}",
+            f"Очередь за {week_label} маркетинг: {sum(st.queue_size(conn, daily_bucket(d, 'marketing')) for d in week_days)}",
             f"Карантин сегодня MP: {st.queue_size(conn, quarantine_bucket(today, 'mp_news'))}",
             f"Карантин сегодня маркетинг: {st.queue_size(conn, quarantine_bucket(today, 'marketing'))}",
             f"Очередь вчера MP: {st.queue_size(conn, daily_bucket(yesterday, 'mp_news'))}",
@@ -2275,6 +2435,7 @@ async def main() -> None:
         asyncio.create_task(daily_digest_worker(out_bot, client, conn), name="daily-digest"),
         asyncio.create_task(vc_digest_worker(out_bot, client, conn), name="vc-digest"),
         asyncio.create_task(marketing_web_digest_worker(out_bot, client, conn), name="marketing-web-digest"),
+        asyncio.create_task(ozon_legacy_digest_worker(out_bot, client, conn), name="ozon-legacy-digest"),
         asyncio.create_task(backup_worker(conn), name="db-backup"),
         asyncio.create_task(admin_bot.run_admin_bot(
             out_bot,

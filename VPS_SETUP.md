@@ -127,14 +127,14 @@ Check real channel post plus AI dry-run:
 docker compose run --rm bot python test_ai_from_posts.py maxprowb --limit 10 --analyze 1
 ```
 
-## 6. Daily digest mode
+## 6. Weekly digest mode
 
-The bot now collects posts during the day by Moscow date and sends the previous day's digest after `daily_digest.send_hour_msk` in `config.yaml` (default: after 09:00 MSK). If the container restarts or catch-up fills the queue after 09:00, the worker keeps trying instead of missing the day.
-Before a post enters the daily queue, the bot filters obvious ads by regex and then asks OpenAI to classify hidden/self-promo ads. Filtered ads are counted in `/stats` and in the digest's "Не вошло" section.
-The daily digest is selective: OpenAI ranks posts by importance, includes only high-priority items, and moves weak opinions, repeats, minor cases, and noise into "Не вошло". It also adds action points, hypotheses to test, and practical observations when they follow from the posts.
+The bot collects posts by Moscow date and sends a weekly digest after `daily_digest.send_hour_msk` in `config.yaml` on `daily_digest.send_weekday_msk` (default: Monday after 09:00 MSK). The default period is the previous 7 full days.
+Before a post enters the queue, the bot filters obvious ads by regex and then asks OpenAI to classify hidden/self-promo ads.
+The weekly digest is selective: OpenAI ranks posts by importance and includes only the strongest weekly items. It prioritizes Ozon, keeps only important WB news, adds action points and hypotheses, and hides source URLs behind clickable titles.
 If OpenAI fails and `daily_digest.send_without_ai` is `false`, the queue is kept and the scheduled digest is not sent as a noisy fallback archive.
 
-The bot also has a catch-up scanner. In addition to live Telegram updates, it walks through all DB channels every `catchup.interval_seconds` seconds (default: 300), reads the latest `catchup.limit_per_channel` posts, and adds unseen messages to the same daily queue.
+The bot also has a catch-up scanner. In addition to live Telegram updates, it walks through all DB channels every `catchup.interval_seconds` seconds (default: 300), reads the latest `catchup.limit_per_channel` posts, and adds unseen messages to the same weekly queue.
 
 Admin commands:
 
@@ -161,7 +161,7 @@ Admin commands:
 /catchup 36                # catch-up scanner window in hours
 ```
 
-Manual `/runjob` does not clear the queue. The scheduled 09:00 MSK digest will still send the full previous day and only then clear that day's queue.
+Manual `/runjob` does not clear the queue. The scheduled Monday 09:00 MSK digest will still send the full weekly digest and only then clear that period's queues.
 
 Add several Telegram channels at once:
 
